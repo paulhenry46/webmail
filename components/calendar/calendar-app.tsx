@@ -75,6 +75,7 @@ import { appPath, buildCalendarPath, parseCalendarPath, type CalendarDeepLink } 
 import { consumePendingDeepLinkEntry, subscribePendingDeepLink } from "@/lib/deep-link-handoff";
 import { useDeepLinkUrl } from "@/hooks/use-deep-link-url";
 import { useProInterfaceActive } from "@/components/pro/pro-interface-redirect";
+import { calendarHooks } from "@/lib/plugin-hooks";
 
 type PendingScopeAction =
   | { type: "edit"; event: CalendarEvent; updates: Partial<CalendarEvent>; sendScheduling?: boolean }
@@ -619,7 +620,7 @@ export function CalendarApp({ linkSegments }: CalendarAppProps = {}) {
     if (!reachingClient) return;
     void (async () => {
       try {
-        const event = await reachingClient.getCalendarEvent(link.id, link.accountId);
+        const event = (await calendarHooks.onAfterFetchEvents.transform([await reachingClient.getCalendarEvent(link.id, link.accountId)]))[0];
         if (!event) {
           toast.error(tDeepLink('event_not_found'));
           return;
@@ -698,7 +699,7 @@ export function CalendarApp({ linkSegments }: CalendarAppProps = {}) {
     if (isServerRecurrenceInstance(occurrence) && occurrence.baseEventId) {
       const accountClient = (occurrence.localAccountId && getClientByLocalAccountId(occurrence.localAccountId)) || client;
       if (!accountClient) return null;
-      const master = await accountClient.getCalendarEvent(occurrence.baseEventId, occurrence.accountId);
+      const master = (await calendarHooks.onAfterFetchEvents.transform([(await accountClient.getCalendarEvent(occurrence.baseEventId, occurrence.accountId))]))[0];
       if (!master) return null;
       return {
         ...master,

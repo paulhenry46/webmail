@@ -349,10 +349,16 @@ export const calendarHooks = {
   onCalendarEventOpen: new HookBus(),
   onBeforeEventCreate: new HookBus(),
   onAfterEventCreate: new HookBus(),
+  //transorm hook to modify the event before it is created Partial<CalendarEvent>
   onBeforeEventUpdate: new HookBus(),
   onAfterEventUpdate: new HookBus(),
   onBeforeEventDelete: new HookBus(),
   onAfterEventDelete: new HookBus(),
+  // transform Hook to modify the filters before fethcing events.
+  onBeforeFetchEvents: new HookBus(),
+  // transform hook to modify events events after they are fetched CalendarEvent[]
+  onAfterFetchEvents: new HookBus(),
+  onBeforeEventsImport: new HookBus(),
   onEventRsvp: new HookBus(),
   onEventsImport: new HookBus(),
   onCalendarDateChange: new HookBus(),
