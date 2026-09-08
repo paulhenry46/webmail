@@ -6158,6 +6158,23 @@ export class JMAPClient implements IJMAPClient {
     }
   }
 
+  private hasTimeBounds(filter: CalendarEventFilter): boolean {
+    let hasAfter = false;
+    let hasBefore = false;
+
+    const traverse = (node: CalendarEventFilter) => {
+      if ('operator' in node) {
+        node.conditions.forEach(traverse);
+      } else {
+        if (node.after) hasAfter = true;
+        if (node.before) hasBefore = true;
+      }
+    };
+
+    traverse(filter);
+    return hasAfter && hasBefore;
+  }
+
   async queryCalendarEvents(
     filter: CalendarEventFilter,
     sort?: Array<{ property: string; isAscending: boolean }>,
@@ -6183,7 +6200,7 @@ export class JMAPClient implements IJMAPClient {
       // (Stalwart >= 0.16.20; the server needs both range bounds for it).
       // Older servers keep the client-side expansion in
       // lib/recurrence-expansion.ts, which runs on whatever comes back.
-      const expandRecurrences = Boolean(filter.after && filter.before)
+      const expandRecurrences = this.hasTimeBounds(filter)
         && await this.supportsSyntheticCalendarIds();
       if (expandRecurrences) {
         queryArgs.expandRecurrences = true;
