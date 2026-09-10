@@ -1,5 +1,5 @@
 import type { IJMAPClient, KeywordDiscoveryResult, KeywordMigration } from '@/lib/jmap/client-interface';
-import type { Email, Mailbox, StateChange, AccountStates, Thread, Identity, EmailAddress, ContactCard, AddressBook, VacationResponse, Calendar, CalendarEvent, CalendarEventFilter, CalendarTask, FileNode, ScheduledEmail, SendEmailResult, SharedAccount } from '@/lib/jmap/types';
+import type { Email, Mailbox, StateChange, AccountStates, Thread, Identity, EmailAddress, ContactCard, AddressBook, VacationResponse, Calendar, CalendarEvent, CalendarTask, FileNode, ScheduledEmail, SendEmailResult, SharedAccount, CalendarEventFilterCondition } from '@/lib/jmap/types';
 import type { SieveScript, SieveCapabilities } from '@/lib/jmap/sieve-types';
 import { getDemoData, type DemoData } from './demo-data';
 import { generateDemoId } from './demo-utils';
@@ -940,7 +940,7 @@ export class DemoJMAPClient implements IJMAPClient {
     return { destroyed: eventIds, notDestroyed: [] };
   }
 
-  async queryCalendarEvents(filter: CalendarEventFilter): Promise<CalendarEvent[]> {
+  async queryCalendarEvents(filter: CalendarEventFilterCondition): Promise<CalendarEvent[]> {
     return this.data.calendarEvents.filter(e => {
       if (filter.after && e.start < filter.after) return false;
       if (filter.before && e.start > filter.before) return false;
@@ -953,7 +953,7 @@ export class DemoJMAPClient implements IJMAPClient {
     });
   }
 
-  async queryAllCalendarEvents(filter: CalendarEventFilter): Promise<CalendarEvent[]> {
+  async queryAllCalendarEvents(filter: CalendarEventFilterCondition): Promise<CalendarEvent[]> {
     return this.queryCalendarEvents(filter);
   }
 
