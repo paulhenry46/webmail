@@ -288,7 +288,15 @@ export type SlotName =
   | 'navigation-rail-bottom'
   | 'calendar-event-actions'
   | 'admin-plugin-page'
-  | 'contact-cryptokeys';
+  | 'contact-cryptokeys'
+  | 'attachment-actions'
+  | 'composer-attachment-source'
+  // Rendered inside a plugin-requested host dialog (see `ui.openDialog` /
+  // PluginDialogHost), NOT in-page like every other slot above - this is
+  // the only slot that renders inside the app-root fixed overlay instead of
+  // wherever the slot is placed in the page, so it's the one to use for a
+  // large, genuinely clickable custom UI a small toolbar/row slot can't fit.
+  | 'plugin-dialog';
 
 export interface SlotRegistration {
   pluginId: string;
@@ -680,7 +688,11 @@ export interface MessageListTab {
    * `hasKeyword`. Use for durable, Sieve-assigned categories.
    */
   keyword?: string | null;
-  /** Lucide icon name rendered before the label (optional). */
+  /**
+   * Icon rendered before the label (optional): a Tabler Icons name such as
+   * `"inbox"` or `"tabler:inbox"`. Lucide names (`"Inbox"`) from older plugins
+   * are still accepted and translated.
+   */
   icon?: string;
   /** CSS color for the active-tab indicator / badge accent (optional). */
   color?: string;
@@ -872,6 +884,20 @@ export interface AttachmentInfo {
   blobId?: string;
   /** The email this attachment belongs to (download / preview) */
   emailId?: string;
+}
+
+/**
+ * A file a plugin has already uploaded to the JMAP server (via
+ * `api.jmap.uploadBlob`) and wants attached to the email the user is
+ * currently composing. Passed to the `onAttach` callback a plugin receives
+ * through the `composer-attachment-source` slot's extraProps.
+ */
+export interface PluginAttachmentUpload {
+  /** JMAP blob id of the already-uploaded content. */
+  blobId: string;
+  name: string;
+  type: string;
+  size: number;
 }
 
 /**

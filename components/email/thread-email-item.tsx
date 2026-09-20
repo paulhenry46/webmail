@@ -6,7 +6,7 @@ import { formatDate } from "@/lib/utils";
 import { Email } from "@/lib/jmap/types";
 import { cn } from "@/lib/utils";
 import { Avatar } from "@/components/ui/avatar";
-import { Paperclip, Star, Circle, CheckSquare, Square, Reply, Forward } from "lucide-react";
+import { Paperclip, Star, Circle, CheckSquare, Square, Reply, Forward } from "@/components/icons";
 import { useEmailDrag } from "@/hooks/use-email-drag";
 import { useLongPress } from "@/hooks/use-long-press";
 import { useEmailStore } from "@/stores/email-store";
@@ -137,9 +137,14 @@ export function ThreadEmailItem({
           </button>
         )}
 
-        {/* Unread indicator */}
+        {/* Unread indicator — anchored on the first line (top padding + half a
+            small avatar), not on the row's midpoint, so it stays in line with
+            the checkbox and avatar when the row wraps to a second line. */}
         {isUnread && (
-          <div className="absolute start-7 top-1/2 -translate-y-1/2">
+          <div
+            className="absolute start-7 -translate-y-1/2"
+            style={{ top: `calc(var(--density-item-py) + ${density === 'extra-compact' ? '0.625rem' : '1rem'})` }}
+          >
             <Circle className="w-1.5 h-1.5 fill-unread text-unread" />
           </div>
         )}

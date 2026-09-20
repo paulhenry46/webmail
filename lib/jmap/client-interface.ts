@@ -170,7 +170,13 @@ export interface IJMAPClient {
   getEmailsInMailbox(mailboxId: string): Promise<Email[]>;
   getEmail(emailId: string, accountId?: string): Promise<Email | null>;
   getSomeEmails(emailsId: string[], accountId?: string): Promise<Email[]>
-  getTagCounts(tagIds: string[]): Promise<Record<string, { total: number; unread: number }>>;
+  /**
+   * Total / unread message counts per tag id. `accountId` scopes the count to
+   * a group/shared account reached through this client (defaults to the
+   * client's own account); the store sums it over every account a tag view
+   * spans (#1038).
+   */
+  getTagCounts(tagIds: string[], accountId?: string): Promise<Record<string, { total: number; unread: number }>>;
   /**
    * Enumerate account keywords for extensions. Servers supporting Keyword/get
    * can return exact counts and provider-label metadata; other servers use the
@@ -405,7 +411,7 @@ export interface IJMAPClient {
   getCalendarEvents(calendarIds?: string[], targetAccountId?: string): Promise<CalendarEvent[]>;
   getCalendarEvent(id: string, targetAccountId?: string): Promise<CalendarEvent | null>;
   createCalendarEvent(event: Partial<CalendarEvent>, sendSchedulingMessages?: boolean, targetAccountId?: string): Promise<CalendarEvent>;
-  batchCreateCalendarEvents(events: Partial<CalendarEvent>[], targetAccountId?: string): Promise<{ created: CalendarEvent[]; failed: string[] }>;
+  batchCreateCalendarEvents(events: Partial<CalendarEvent>[], targetAccountId?: string): Promise<{ created: CalendarEvent[]; failed: string[]; notCreated: Record<string, { type?: string; description?: string }> }>;
   updateCalendarEvent(
     eventId: string,
     updates: Partial<CalendarEvent>,
@@ -413,7 +419,7 @@ export interface IJMAPClient {
     targetAccountId?: string,
   ): Promise<void>;
   deleteCalendarEvent(eventId: string, sendSchedulingMessages?: boolean, targetAccountId?: string): Promise<void>;
-  batchDeleteCalendarEvents(eventIds: string[], targetAccountId?: string): Promise<{ destroyed: string[]; notDestroyed: string[] }>;
+  batchDeleteCalendarEvents(eventIds: string[], targetAccountId?: string): Promise<{ destroyed: string[]; notDestroyed: Record<string, { type?: string; description?: string }> }>;
   queryCalendarEvents(filter: CalendarEventFilter, sort?: Array<{ property: string; isAscending: boolean }>, limit?: number, targetAccountId?: string): Promise<CalendarEvent[]>;
   queryAllCalendarEvents(filter: CalendarEventFilter, sort?: Array<{ property: string; isAscending: boolean }>, limit?: number): Promise<CalendarEvent[]>;
   parseCalendarEvents(accountId: string, blobId: string): Promise<Partial<CalendarEvent>[]>;

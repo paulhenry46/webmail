@@ -9,7 +9,7 @@ import { SearchFilters, DEFAULT_SEARCH_FILTERS, buildJMAPFilter, isFilterEmpty }
 import { emailHooks } from "@/lib/plugin-hooks";
 import { resolveThreadRoute } from "@/lib/thread-routing";
 import type { ExternalSearchResult } from "@/lib/plugin-types";
-import { fetchUnifiedEmails, fetchUnifiedMailboxCounts, searchUnifiedEmails, advancedSearchUnifiedEmails, fetchCrossViewEmails, searchCrossViewEmails, advancedSearchCrossViewEmails, getCrossUnreadTotal, type UnifiedAccountClient, type UnifiedMailboxCounts } from "@/lib/unified-mailbox";
+import { fetchUnifiedEmails, fetchUnifiedMailboxCounts, searchUnifiedEmails, advancedSearchUnifiedEmails, fetchCrossViewEmails, searchCrossViewEmails, advancedSearchCrossViewEmails, fetchTagEmails, getCrossUnreadTotal, type UnifiedAccountClient, type UnifiedMailboxCounts } from "@/lib/unified-mailbox";
 import { useAuthStore } from "@/stores/auth-store";
 import { useAccountStore } from "@/stores/account-store";
 import { useMessageListTabsStore } from "@/stores/message-list-tabs-store";
@@ -566,12 +566,85 @@ function resolveActionClient(passedClient: IJMAPClient): IJMAPClient {
   return c ?? passedClient;
 }
 
+/**
+ * Thrown by archive actions when no archive folder exists in the target
+ * account. Callers map it to the translated
+ * `email_viewer.archive_mailbox_not_found` toast; a silent return left the
+ * user with a shortcut/button that did nothing. (#578)
+ */
+export class ArchiveMailboxNotFoundError extends Error {
+  constructor() {
+    super('Archive mailbox not found - cannot archive email');
+    this.name = 'ArchiveMailboxNotFoundError';
+  }
+}
+
+/**
+ * Archive folder for a single-email or batch archive.
+ *
+ * `accountId` pins the owning account (unified view). Otherwise the selected
+ * mailbox decides: a shared/group folder scopes the lookup to its owner, an own
+ * folder to non-shared mailboxes. The user's own Archive is listed first in the
+ * merged own+shared list, so an unscoped `find` would pair the shared owner's
+ * accountId with a foreign mailbox id and Stalwart rejects the move. (#889)
+ */
+export function findArchiveMailbox(
+  mailboxes: Mailbox[],
+  selectedMailboxId: string | null | undefined,
+  accountId?: string,
+): Mailbox | undefined {
+  const viewMailbox = mailboxes.find(m => m.id === selectedMailboxId);
+  const scopeId = accountId ?? (viewMailbox?.isShared ? viewMailbox.accountId : undefined);
+  const isArchive = (m: Mailbox) => m.role === 'archive' || m.name.toLowerCase() === 'archive';
+  return mailboxes.find(m =>
+    isArchive(m) && (scopeId ? m.accountId === scopeId : !m.isShared)
+  );
+}
+
+/**
+ * JMAP accountId for opening an email that carries no source stamps.
+ *
+ * Normally the selected folder decides: a shared/group folder's owner, else
+ * the account's own (undefined). During an unscoped ("All folders") search
+ * the hits come from the primary account even while a shared folder is
+ * selected, so deriving the owner from that folder asks the wrong account and
+ * `getEmail` returns nothing. In that case the caller's own account is used
+ * (searching the shared owners too is a separate issue). (#923)
+ */
+export function resolveUnstampedEmailAccountId(opts: {
+  mailboxes: Mailbox[];
+  selectedMailbox: string | null | undefined;
+  searchActive: boolean;
+  searchMailboxId: string;
+}): string | undefined {
+  if (opts.searchActive && opts.searchMailboxId === '') return undefined;
+  const mailbox = opts.mailboxes.find(mb => mb.id === opts.selectedMailbox);
+  return mailbox?.isShared ? mailbox.accountId : undefined;
+}
+
 function resolveActionMailboxes(): Mailbox[] {
   const state = useEmailStore.getState();
   if (state.viewingAccountId) {
     return state.accountMailboxes[state.viewingAccountId] ?? state.mailboxes;
   }
   return state.mailboxes;
+}
+
+// List requests can finish after navigation. Never apply an old folder/tag
+// response (or error) to the view the user has since selected.
+function captureEmailListView(): () => boolean {
+  const view = useEmailStore.getState();
+  const activeAccountId = useAuthStore.getState().activeAccountId;
+  return () => {
+    const current = useEmailStore.getState();
+    return current.selectedMailbox === view.selectedMailbox
+      && current.selectedKeyword === view.selectedKeyword
+      && current.viewingAccountId === view.viewingAccountId
+      && current.isUnifiedView === view.isUnifiedView
+      && current.unifiedRole === view.unifiedRole
+      && current.crossView === view.crossView
+      && useAuthStore.getState().activeAccountId === activeAccountId;
+  };
 }
 
 /**
@@ -874,6 +947,74 @@ export async function buildUnifiedAccountClients(
     }));
   }
   return built;
+}
+
+/**
+ * The accounts a tag view spans: the active/viewing login's own account plus
+ * every group/shared owner whose folders that login can see (#1038).
+ *
+ * A tag keyword is set on messages in all of them, so the sidebar tag entry
+ * fans out over the whole set instead of only the account of the folder that
+ * happened to be selected. Built synchronously from the mailbox list the
+ * sidebar already holds (own + delegated folders), so no extra round trip.
+ * Every entry reaches the server through the same login client; shared
+ * entries are flagged so JMAP requests target the owner's accountId.
+ */
+export function buildTagViewAccountClients(passedClient: IJMAPClient): UnifiedAccountClient[] {
+  const client = resolveActionClient(passedClient);
+  const mailboxes = resolveActionMailboxes();
+  const state = useEmailStore.getState();
+  const auth = useAuthStore.getState();
+  // AccountEntry.id of the login this client belongs to (`getClientForAccount`
+  // key), stamped as `sourceClientAccountId` so actions resolve the client.
+  let clientAccountId: string | undefined;
+  for (const [id, c] of auth.getAllConnectedClients()) {
+    if (c === client) { clientAccountId = id; break; }
+  }
+  clientAccountId ??= state.viewingAccountId ?? auth.activeAccountId ?? client.getAccountId();
+  const primaryJmapId = client.getAccountId();
+  const account = useAccountStore.getState().getAccountById(clientAccountId);
+
+  const own = mailboxes.filter((m) => !m.isShared);
+  const built: UnifiedAccountClient[] = [{
+    accountId: clientAccountId,
+    accountLabel: account?.label || account?.email || primaryJmapId,
+    client,
+    mailboxes: own,
+    clientAccountId,
+    jmapAccountId: primaryJmapId,
+    isShared: false,
+  }];
+
+  const sharedByOwner = new Map<string, Mailbox[]>();
+  for (const m of mailboxes) {
+    if (!m.isShared || !m.accountId || m.accountId === primaryJmapId) continue;
+    const list = sharedByOwner.get(m.accountId) ?? [];
+    list.push(m);
+    sharedByOwner.set(m.accountId, list);
+  }
+  for (const [ownerId, ownerMailboxes] of sharedByOwner) {
+    built.push({
+      accountId: ownerId,
+      accountLabel: ownerMailboxes.find((m) => m.accountName)?.accountName || ownerId,
+      client,
+      mailboxes: ownerMailboxes,
+      clientAccountId,
+      jmapAccountId: ownerId,
+      isShared: true,
+    });
+  }
+  return built;
+}
+
+/**
+ * Whether the current list mixes messages from several accounts, so actions
+ * must route by each email's source stamps rather than by the selected
+ * folder: the unified / cross-account views, and a tag view (#1038).
+ */
+function isAggregateListView(): boolean {
+  const s = useEmailStore.getState();
+  return s.isUnifiedView || !!s.selectedKeyword;
 }
 
 /**
@@ -1275,6 +1416,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
   selectAccountMailbox: (accountId, mailboxId) => set({
     viewingAccountId: accountId,
     selectedMailbox: mailboxId,
+    isLoadingMore: false,
     selectedEmail: null,
     selectedEmailIds: new Set(),
     selectedKeyword: null,
@@ -1319,6 +1461,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
   },
   selectKeyword: (keyword) => set({
     selectedKeyword: keyword,
+    isLoadingMore: false,
     selectedEmail: null,
     selectedEmailIds: new Set(),
     expandedThreadIds: new Set(),
@@ -1333,7 +1476,21 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
         return;
       }
       const tagIds = keywords.map(k => k.id);
-      const counts = await resolveActionClient(client).getTagCounts(tagIds);
+      // The badge counts what the tag view lists: messages in the own account
+      // AND in the group/shared accounts this login reaches (#1038). Sum the
+      // per-account counts; an account that fails just contributes nothing.
+      const built = buildTagViewAccountClients(client);
+      const perAccount = await Promise.allSettled(
+        built.map((a) => a.client.getTagCounts(tagIds, a.isShared ? a.accountId : undefined)),
+      );
+      const counts: Record<string, { total: number; unread: number }> = {};
+      for (const outcome of perAccount) {
+        if (outcome.status !== 'fulfilled') continue;
+        for (const [id, c] of Object.entries(outcome.value)) {
+          const cur = counts[id] ?? { total: 0, unread: 0 };
+          counts[id] = { total: cur.total + c.total, unread: cur.unread + c.unread };
+        }
+      }
       set({ tagCounts: counts });
     } catch (error) {
       console.error('Failed to fetch tag counts:', error);
@@ -1341,6 +1498,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
   }),
   selectMailbox: (mailboxId) => set({
     selectedMailbox: mailboxId,
+    isLoadingMore: false,
     selectedEmail: null,
     selectedEmailIds: new Set(),
     selectedKeyword: null,
@@ -1484,6 +1642,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
   },
 
   fetchEmails: async (client, mailboxId, opts) => {
+    const isCurrentView = captureEmailListView();
     // A background refresh (e.g. after an account switch restored a cached list)
     // repopulates the list without showing the loading overlay, so switching to
     // an already-visited account doesn't flash a spinner over the visible mail.
@@ -1528,6 +1687,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
                 ? await searchUnifiedEmails(built, unifiedRole!, searchQuery, emailsPerPage, 0)
                 : await fetchUnifiedEmails(built, unifiedRole!, emailsPerPage, 0, getMessageListOrderFor(unifiedRole)));
         const enrichedEmails = await emailHooks.onEmailsFetched.transform(result.emails);
+        if (!isCurrentView()) return;
         set({
           emails: annotateScheduledEmails(enrichedEmails, get().scheduledSubmissionByEmailId),
           hasMoreEmails: result.hasMore,
@@ -1543,6 +1703,39 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
         return;
       }
 
+      // Get emails per page from settings
+      const emailsPerPage = useSettingsStore.getState().emailsPerPage;
+
+      // A tag view takes precedence over the selected folder. Tags span
+      // folders AND accounts: the same keyword sits on messages in the user's
+      // own account and in the group/shared accounts they can reach, so fan
+      // out over all of them instead of querying only the account of the
+      // folder that happened to be selected (#1038). A tag view has no role,
+      // so it only follows the list order under the "all folders" scope (#718).
+      const { selectedKeyword } = get();
+      if (selectedKeyword) {
+        const order = getMessageListOrderFor(null);
+        const built = buildTagViewAccountClients(client);
+        const result = await fetchTagEmails(built, `$label:${selectedKeyword}`, emailsPerPage, 0, order);
+        const enrichedEmails = await emailHooks.onEmailsFetched.transform(result.emails);
+        if (!isCurrentView()) return;
+        set({
+          emails: annotateScheduledEmails(enrichedEmails, get().scheduledSubmissionByEmailId),
+          hasMoreEmails: result.hasMore,
+          totalEmails: result.total,
+          listOrder: order,
+          // A server-side keyword filter cannot be delta-synced.
+          emailListSync: null,
+          threadEmailsCache: new Map(),
+          expandedThreadIds: new Set(),
+          isLoadingThread: null,
+          isLoading: false,
+          unifiedErrors: result.errors,
+        });
+        void get().fetchThreadEmailCounts(client);
+        return;
+      }
+
       const effectiveClient = resolveActionClient(client);
 
       // Find the mailbox to get its accountId (for shared folder support)
@@ -1553,41 +1746,30 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
       // Use originalId for JMAP queries (shared mailboxes use namespaced IDs in the store)
       const jmapMailboxId = mailbox?.originalId || targetMailboxId;
 
-      // Get emails per page from settings
-      const emailsPerPage = useSettingsStore.getState().emailsPerPage;
-
-      // Build keyword filter if a tag is selected
-      const { selectedKeyword } = get();
-      const keywordFilter = selectedKeyword ? `$label:${selectedKeyword}` : undefined;
-
       // Plugin-registered category tabs (Gmail-style) AND their resolved JMAP
-      // filter fragment into the mailbox view. Tag views take precedence.
-      const categoryFilter = selectedKeyword
-        ? null
-        : useMessageListTabsStore.getState().getCategoryFilter(mailbox?.role);
+      // filter fragment into the mailbox view.
+      const categoryFilter = useMessageListTabsStore.getState().getCategoryFilter(mailbox?.role);
 
-      // The configured list order (#718). A tag view spans folders and has no
-      // role, so it only follows the order under the "all folders" scope.
-      const order = getMessageListOrderFor(selectedKeyword ? null : mailbox?.role);
+      // The configured list order (#718).
+      const order = getMessageListOrderFor(mailbox?.role);
 
-      // When filtering by tag, omit the mailbox constraint so emails across
-      // all folders that carry the tag are returned.
       const result = await effectiveClient.getEmails(
-        selectedKeyword ? undefined : jmapMailboxId,
+        jmapMailboxId,
         accountId,
         emailsPerPage,
         0,
-        keywordFilter,
+        undefined,
         true,
         categoryFilter ?? undefined,
         order,
       );
       const enrichedEmails = await emailHooks.onEmailsFetched.transform(result.emails);
-      // Only a plain folder list can be delta-synced; tag and category views
-      // filter server-side, and a delta cannot tell which changed rows would
-      // match that filter.
+      if (!isCurrentView()) return;
+      // Only a plain folder list can be delta-synced; category views filter
+      // server-side, and a delta cannot tell which changed rows would match
+      // that filter.
       const emailListSync: EmailListSync | null =
-        result.state && !selectedKeyword && !categoryFilter
+        result.state && !categoryFilter
           ? {
               state: result.state,
               accountId: accountId ?? effectiveClient.getAccountId(),
@@ -1609,6 +1791,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
       // Fetch full thread counts in the background (non-blocking)
       void get().fetchThreadEmailCounts(client);
     } catch (error) {
+      if (!isCurrentView()) return;
       console.error('Failed to fetch emails:', error);
       // A failed background refresh must not wipe the list it was refreshing -
       // keep the restored/prefetched emails visible and just surface the error.
@@ -1628,6 +1811,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
 
   loadMoreEmails: async (client) => {
     const { isLoadingMore, hasMoreEmails, emails, selectedMailbox, searchQuery, selectedKeyword, isUnifiedView, unifiedRole, crossView } = get();
+    const isCurrentView = captureEmailListView();
 
     // Don't load if already loading or no more emails
     if (isLoadingMore || !hasMoreEmails) return;
@@ -1651,6 +1835,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
         const existingIds = new Set(currentEmails.map(e => e.id));
         const newEmails = result.emails.filter(e => !existingIds.has(e.id));
         const enrichedNewEmails = await emailHooks.onEmailsFetched.transform(newEmails);
+        if (!isCurrentView()) return;
         set({
           emails: [...currentEmails, ...enrichedNewEmails],
           hasMoreEmails: result.hasMore,
@@ -1659,6 +1844,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
           unifiedErrors: result.errors,
         });
       } catch (error) {
+        if (!isCurrentView()) return;
         console.error('Failed to load more cross-account emails:', error);
         set({
           error: error instanceof Error ? error.message : "Failed to load more emails",
@@ -1695,6 +1881,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
         const existingIds = new Set(currentEmails.map(e => e.id));
         const newEmails = result.emails.filter(e => !existingIds.has(e.id));
         const enrichedNewEmails = await emailHooks.onEmailsFetched.transform(newEmails);
+        if (!isCurrentView()) return;
         set({
           emails: [...currentEmails, ...enrichedNewEmails],
           hasMoreEmails: result.hasMore,
@@ -1703,6 +1890,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
           unifiedErrors: result.errors,
         });
       } catch (error) {
+        if (!isCurrentView()) return;
         console.error('Failed to load more unified emails:', error);
         set({
           error: error instanceof Error ? error.message : "Failed to load more emails",
@@ -1747,6 +1935,15 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
         } else {
           result = await effectiveClient.searchEmails(searchQuery, jmapMailboxId, accountId, emailsPerPage, position);
         }
+      } else if (selectedKeyword) {
+        // Tag view: the next page of the same cross-account fan-out the
+        // initial fetch ran (same keyword, no folder constraint, same order),
+        // so pagination spans the own and group accounts alike (#1038).
+        const built = buildTagViewAccountClients(client);
+        result = await fetchTagEmails(
+          built, `$label:${selectedKeyword}`, emailsPerPage, position, getMessageListOrderFor(null),
+        );
+        set({ unifiedErrors: result.errors });
       } else {
         // Load more from mailbox
         // Find the mailbox to get its accountId (for shared folder support)
@@ -1757,21 +1954,18 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
         // Use originalId for JMAP queries (shared mailboxes use namespaced IDs in the store)
         const jmapMailboxId = mailbox?.originalId || selectedMailbox;
 
-        // When filtering by tag, omit the mailbox constraint (same rationale as fetchEmails).
         // Category tabs (plugin-registered) must filter pagination the same
         // way as the initial fetch or pages would mix categories.
-        const categoryFilter = selectedKeyword
-          ? null
-          : useMessageListTabsStore.getState().getCategoryFilter(mailbox?.role);
+        const categoryFilter = useMessageListTabsStore.getState().getCategoryFilter(mailbox?.role);
         result = await effectiveClient.getEmails(
-          selectedKeyword ? undefined : jmapMailboxId,
+          jmapMailboxId,
           accountId,
           emailsPerPage,
           position,
-          selectedKeyword ? `$label:${selectedKeyword}` : undefined,
+          undefined,
           true,
           categoryFilter ?? undefined,
-          getMessageListOrderFor(selectedKeyword ? null : mailbox?.role),
+          getMessageListOrderFor(mailbox?.role),
         );
       }
 
@@ -1785,6 +1979,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
       const newEmails = annotateScheduledEmails(result.emails, get().scheduledSubmissionByEmailId).filter((e: Email) => !existingIds.has(e.id));
 
       const enrichedNewEmails = await emailHooks.onEmailsFetched.transform(newEmails);
+      if (!isCurrentView()) return;
       set({
         emails: [...currentEmails, ...enrichedNewEmails],
         hasMoreEmails: result.hasMore,
@@ -1796,6 +1991,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
         void get().fetchThreadEmailCounts(client);
       }
     } catch (error) {
+      if (!isCurrentView()) return;
       console.error('Failed to load more emails:', error);
       set({
         error: error instanceof Error ? error.message : "Failed to load more emails",
@@ -1919,7 +2115,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
       // The email's current mailbox drives the junk auto-permanent-delete rule.
       // In unified view it comes from the email's own folders (matching the
       // unified role), not the active account's selected mailbox.
-      const currentMailbox = get().isUnifiedView
+      const currentMailbox = isAggregateListView()
         ? (mailboxes.find(mb => emailInMailbox(email, mb) && mb.role === get().unifiedRole)
             ?? mailboxes.find(mb => emailInMailbox(email, mb)))
         : mailboxes.find(mb => mb.id === get().selectedMailbox);
@@ -1985,8 +2181,8 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
         throw new Error('Trash mailbox not found - cannot move email to trash');
       }
 
-      // Permanent delete
-      await effectiveClient.deleteEmail(emailId);
+      // Permanent delete - in the email's own account, like the batch path.
+      await effectiveClient.deleteEmail(emailId, accountId);
 
       // Remove from local state and update mailbox counters (in the email's own
       // account list). Unread emails also decrement the unread counters. (#281)
@@ -2245,14 +2441,14 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
     }
 
     try {
-      const { emails, selectedMailbox, isUnifiedView } = get();
+      const { emails, selectedMailbox } = get();
       const mailboxes = resolveActionMailboxes();
       const destMailbox = mailboxes.find(mb => mb.id === destinationMailboxId);
       const jmapDestId = destMailbox?.originalId || destinationMailboxId;
       const idSet = new Set(emailIds);
       const affected = emails.filter(e => idSet.has(e.id));
 
-      if (isUnifiedView) {
+      if (isAggregateListView()) {
         // In unified view, emails may span accounts – group by owning JMAP account
         // and dispatch through the login client that can reach each one. The login
         // client is keyed by `sourceClientAccountId` (a real AccountEntry.id); the
@@ -2498,7 +2694,22 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
   },
 
   searchEmails: async (client, query) => {
-    set({ isLoading: true, error: null, searchQuery: query, emails: [], hasMoreEmails: false, totalEmails: 0 }); // Clear emails for loading state
+    const { searchAbortController } = get();
+
+    if (searchAbortController) {
+      searchAbortController.abort();
+    }
+
+    const controller = new AbortController();
+    set({
+      isLoading: true,
+      error: null,
+      searchQuery: query,
+      emails: [],
+      hasMoreEmails: false,
+      totalEmails: 0,
+      searchAbortController: controller,
+    }); // Clear emails for loading state
     try {
       const { isUnifiedView, unifiedRole, crossView, searchMailboxId, searchFilters } = get();
       const emailsPerPage = useSettingsStore.getState().emailsPerPage;
@@ -2547,10 +2758,14 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
         result.total += newEmails.length;
       }
 
+      if (controller.signal.aborted) return;
+
       const externals = await emailHooks.onProvideSearchResults.transform([] as ExternalSearchResult[], {
-        query, 
-        filters: searchFilters 
+        query,
+        filters: searchFilters
       });
+
+      if (controller.signal.aborted) return;
       result.emails = await emailHooks.onEmailsFetched.transform(result.emails);
       set({
         emails: annotateScheduledEmails(result.emails, get().scheduledSubmissionByEmailId),
@@ -2558,16 +2773,19 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
         hasMoreEmails: result.hasMore,
         totalEmails: result.total,
         isLoading: false,
-        ...(unifiedErrors ? { unifiedErrors } : {}) 
+        searchAbortController: null,
+        ...(unifiedErrors ? { unifiedErrors } : {})
       });
     } catch (error) {
+      if (controller.signal.aborted) return;
       set({
         error: error instanceof Error ? error.message : "Failed to search emails",
         isLoading: false,
         emails: [],
         externalSearchResults: [],
         hasMoreEmails: false,
-        totalEmails: 0
+        totalEmails: 0,
+        searchAbortController: null,
       });
     }
   },
@@ -2787,7 +3005,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
     try {
       const emailIdsArray = Array.from(selectedEmailIds);
 
-      if (get().isUnifiedView) {
+      if (isAggregateListView()) {
         // Group by owning JMAP account; dispatch through the reaching login client.
         const bySource = new Map<string, { clientAccountId?: string; ids: string[] }>();
         for (const emailId of emailIdsArray) {
@@ -3000,7 +3218,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
     try {
       const emailIdsArray = Array.from(selectedEmailIds);
 
-      if (get().isUnifiedView) {
+      if (isAggregateListView()) {
         // Group by owning JMAP account; dispatch through the reaching login client.
         const destMailbox = resolveActionMailboxes().find(mb => mb.id === toMailboxId);
         const jmapDestId = destMailbox?.originalId || toMailboxId;
@@ -3060,12 +3278,12 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
     // Scope the archive folder to the viewed shared/group account (if any) so the
     // move lands on the owner account, not the user's own archive (which appears
     // first in the merged list); see resolveViewAccountId. Own view is unchanged.
-    const viewAccountId = resolveViewAccountId();
-    const isArchive = (m: Mailbox) => m.role === 'archive' || m.name.toLowerCase() === 'archive';
-    const archiveMailbox = mailboxes.find(m =>
-      isArchive(m) && (viewAccountId ? m.accountId === viewAccountId : !m.isShared)
-    );
-    if (!archiveMailbox) return;
+    const archiveMailbox = findArchiveMailbox(mailboxes, get().selectedMailbox);
+    if (!archiveMailbox) {
+      const error = new ArchiveMailboxNotFoundError();
+      set({ error: error.message });
+      throw error;
+    }
 
     const mode = useSettingsStore.getState().archiveMode;
     const archiveId = archiveMailbox.originalId || archiveMailbox.id;
@@ -3101,8 +3319,16 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
 
   // Spam operations
   markAsSpam: async (client, emailId) => {
-    const email = get().emails.find(e => e.id === emailId);
-    if (!email) return;
+    // The viewer may show an email the list no longer holds (e.g. the unread
+    // quick-filter dropped it once it was read), so fall back to the selected
+    // email like moveThreadToMailbox does. Throw rather than no-op so the
+    // caller's success toast cannot fire for a message that was not moved. (#695)
+    const state = get();
+    const email = state.emails.find(e => e.id === emailId)
+      ?? (state.selectedEmail?.id === emailId ? state.selectedEmail : null);
+    if (!email) {
+      throw new Error('Email not found - cannot mark as spam');
+    }
 
     // In unified view route to the email's own account (client + that account's
     // mailbox list); otherwise the active/viewing context. (#281)
@@ -3111,7 +3337,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
     // The email's current mailbox is what undo restores it to. In unified view
     // derive it from the email's own folders (preferring the unified role),
     // otherwise the active account's selected mailbox.
-    const currentMailbox = get().isUnifiedView
+    const currentMailbox = isAggregateListView()
       ? (mailboxes.find(mb => emailInMailbox(email, mb) && mb.role === get().unifiedRole)
           ?? mailboxes.find(mb => emailInMailbox(email, mb)))
       : mailboxes.find(m => m.id === get().selectedMailbox);
@@ -3475,14 +3701,18 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
       // changed - and only re-queried when the delta cannot be applied.
       const sync = get().emailListSync;
       const syncedAccountEmailState = sync ? change.changed[sync.accountId]?.Email : undefined;
-      if (accountChanges?.Email || syncedAccountEmailState) {
+      // A tag view and the sidebar tag badges span the own AND the group/shared
+      // accounts (#1038), so an Email change in any of them concerns them.
+      const anyEmailChanged = Object.values(change.changed).some((c) => c?.Email);
+      const tagViewChanged = !!get().selectedKeyword && anyEmailChanged;
+      if (accountChanges?.Email || syncedAccountEmailState || tagViewChanged) {
         const applied = syncedAccountEmailState
           ? await get().applyEmailDelta(client, syncedAccountEmailState)
           : false;
         if (!applied) {
           await get().refreshCurrentMailbox(client);
         }
-        if (accountChanges?.Email) {
+        if (anyEmailChanged) {
           get().fetchTagCounts(client);
         }
       }
@@ -3556,12 +3786,13 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
   },
 
   refreshCurrentMailbox: (client) => coalesceRefresh(client, 'currentMailbox', async () => {
-    const { selectedMailbox } = get();
+    const { selectedMailbox, selectedKeyword } = get();
+    const isCurrentView = captureEmailListView();
 
-    // Only refresh if a mailbox is currently selected
-    if (!selectedMailbox) return;
+    // Labels span folders and can be selected without a mailbox.
+    if (!selectedMailbox && !selectedKeyword) return;
 
-    if (selectedMailbox === VIRTUAL_SCHEDULED_MAILBOX_ID) {
+    if (!selectedKeyword && selectedMailbox === VIRTUAL_SCHEDULED_MAILBOX_ID) {
       await get().fetchScheduledEmails(client);
       return;
     }
@@ -3588,7 +3819,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
       let mailbox;
       let unifiedErrors: Map<string, string> | undefined;
       let syncAfterRefresh: EmailListSync | null = null;
-      if (isUnifiedView && crossView) {
+      if (!selectedKeyword && isUnifiedView && crossView) {
         const includeGroup = useSettingsStore.getState().includeGroupInUnified;
         const built = await buildUnifiedAccountClients({ includeGroup });
         result = hasFilters
@@ -3597,7 +3828,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
             ? await searchCrossViewEmails(built, crossView, searchQuery, emailsPerPage, 0)
             : await fetchCrossViewEmails(built, crossView, emailsPerPage, 0);
         unifiedErrors = result.errors;
-      } else if (isUnifiedView && unifiedRole) {
+      } else if (!selectedKeyword && isUnifiedView && unifiedRole) {
         const includeGroup = useSettingsStore.getState().includeGroupInUnified;
         const built = await buildUnifiedAccountClients({ includeGroup });
         result = hasFilters
@@ -3614,7 +3845,16 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
         mailbox = mailboxes.find(mb => mb.id === selectedMailbox);
         const accountId = mailbox?.isShared ? mailbox.accountId : undefined;
         const jmapMailboxId = mailbox?.originalId || selectedMailbox;
-        if (hasFilters || searchQuery) {
+        if (selectedKeyword) {
+          // Match fetchEmails: tag views take precedence and query the label
+          // across all folders and across the own + group accounts (#1038).
+          // They cannot establish a folder delta baseline.
+          const built = buildTagViewAccountClients(client);
+          result = await fetchTagEmails(
+            built, `$label:${selectedKeyword}`, emailsPerPage, 0, getMessageListOrderFor(null),
+          );
+          unifiedErrors = result.errors;
+        } else if (hasFilters || searchQuery) {
           // A refresh while a search is active must re-run it under the
           // search's own folder scope, which is independent of selectedMailbox.
           const { searchMailboxId } = get();
@@ -3631,6 +3871,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
             : null;
         }
       }
+      if (!isCurrentView()) return;
       set({ emailListSync: syncAfterRefresh });
 
       const currentEmails = get().emails;
@@ -3653,6 +3894,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
         ) ?? result.emails[0];
       if (
         newFirst &&
+        !selectedKeyword &&
         mailbox?.role === 'inbox' &&
         !currentEmails.some(e => e.id === newFirst.id)
       ) {
@@ -3841,7 +4083,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
       // selected-mailbox shared-folder logic. (#281)
       const threadEmail = get().emails.find(e => e.threadId === threadId);
       const route = resolveThreadRoute({
-        isUnifiedView: get().isUnifiedView,
+        isUnifiedView: isAggregateListView(),
         ref: threadEmail,
         mailboxes,
         selectedMailbox,
@@ -3856,7 +4098,7 @@ export const useEmailStore = create<EmailStore>((set, get) => ({
 
       // Re-stamp the source reference so actions on thread emails resolve to the
       // right account (the fetched objects don't carry it).
-      if (get().isUnifiedView && threadEmail) {
+      if (isAggregateListView() && threadEmail) {
         for (const e of emails) {
           e.accountId = threadEmail.accountId;
           e.accountLabel = threadEmail.accountLabel;
