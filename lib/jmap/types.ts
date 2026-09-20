@@ -836,7 +836,7 @@ export interface CalendarEventNotification {
   eventPatch?: Record<string, unknown>;
 }
 
-export interface CalendarEventFilter {
+export interface CalendarEventFilterCondition {
   inCalendars?: string[];
   after?: string;
   before?: string;
@@ -850,6 +850,12 @@ export interface CalendarEventFilter {
   uid?: string;
   types?: string[];
 }
+export interface CalendarEventFilterOperator {
+  operator: 'AND' | 'OR' | 'NOT';
+  conditions: CalendarEventFilter[];
+}
+
+export type CalendarEventFilter = CalendarEventFilterCondition | CalendarEventFilterOperator;
 
 // JMAP Push Notification Types (RFC 8620 Section 7)
 

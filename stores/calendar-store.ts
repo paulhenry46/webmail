@@ -21,6 +21,7 @@ import { generateUUID } from '@/lib/utils';
 import { apiFetch } from '@/lib/browser-navigation';
 import { BIRTHDAY_CALENDAR_ID } from '@/lib/birthday-calendar';
 import { getClientByLocalAccountId } from './client-registry';
+import { calendarHooks } from '@/lib/plugin-hooks';
 
 /**
  * When the Pro shell aggregates calendars/events from every connected
@@ -538,10 +539,11 @@ export const useCalendarStore = create<CalendarStore>()(
         refetchVisibleRange = () => get().fetchEvents(client, start, end, { silent: true });
         set(options?.silent ? { error: null } : { isLoadingEvents: true, error: null });
         try {
-          const rawEvents = await client.queryAllCalendarEvents({
+          const filter = await calendarHooks.onBeforeFetchEvents.transform({
             after: start,
             before: end,
-          });
+          })
+          const rawEvents = await client.queryAllCalendarEvents(filter);
           // Filter out malformed events missing required 'start' field, or
           // whose start string fails to parse (would otherwise crash format()
           // calls in the rendering path - #316).
@@ -553,7 +555,7 @@ export const useCalendarStore = create<CalendarStore>()(
           // without synthetic-id support (lib/recurrence-instances.ts) or one
           // that ignores expandRecurrences. Occurrences the server already
           // expanded pass through untouched.
-          const events = expandRecurringEvents(validEvents, start, end);
+          let events = expandRecurringEvents(validEvents, start, end);
           debug.log('calendar', 'Calendar fetchEvents completed', {
             start,
             end,
@@ -562,6 +564,7 @@ export const useCalendarStore = create<CalendarStore>()(
             expandedCount: events.length,
             droppedEvents,
           });
+          events  = await calendarHooks.onAfterFetchEvents.transform(events);
           if (droppedEvents > 0) {
             debug.warn('calendar', 'Calendar fetchEvents dropped malformed events without a start field', { droppedEvents });
           }
@@ -604,10 +607,14 @@ export const useCalendarStore = create<CalendarStore>()(
         refetchVisibleRange = () => get().fetchAllAccountsEvents(accounts, start, end, { silent: true });
         set(options?.silent ? { error: null } : { isLoadingEvents: true, error: null });
         try {
+          const filter = await calendarHooks.onBeforeFetchEvents.transform({
+            after: start,
+            before: end,
+          })
           const results = await Promise.all(
             accounts.map(async ({ client, localAccountId }) => {
               try {
-                const raw = await client.queryAllCalendarEvents({ after: start, before: end });
+                const raw = await client.queryAllCalendarEvents(filter);
                 const valid = raw.filter(e =>
                   typeof e.start === 'string' && e.start && !isNaN(parseISO(e.start).getTime())
                 );
@@ -619,7 +626,8 @@ export const useCalendarStore = create<CalendarStore>()(
               }
             }),
           );
-          set({ events: results.flat(), isLoadingEvents: false, dateRange: { start, end } });
+          const events = await calendarHooks.onAfterFetchEvents.transform(results.flat());
+          set({ events: events, isLoadingEvents: false, dateRange: { start, end } });
         } catch (error) {
           debug.error('Failed to fetch all-account events:', error);
           set({ error: 'Failed to load events', isLoadingEvents: false });
@@ -634,7 +642,7 @@ export const useCalendarStore = create<CalendarStore>()(
           // server's client when in multi-account Pro mode.
           let targetAccountId = event.accountId;
           let localAccountId = event.localAccountId;
-          const cleanEvent = sanitizeOutgoingCalendarEventData({ ...event });
+          const cleanEvent = await calendarHooks.onBeforeEventCreate.transform(sanitizeOutgoingCalendarEventData({ ...event }));
           if (event.calendarIds) {
             const remapped: Record<string, boolean> = {};
             for (const calId of Object.keys(event.calendarIds)) {
@@ -732,7 +740,8 @@ export const useCalendarStore = create<CalendarStore>()(
             updateKeys: Object.keys(updates),
           });
           // Remap namespaced calendarIds back to original IDs
-          const cleanUpdates = sanitizeOutgoingCalendarEventData({ ...updates });
+          const {cleanUpdates} = await calendarHooks.onBeforeEventUpdate.transform({cleanUpdates: sanitizeOutgoingCalendarEventData({ ...updates }), realId});
+
           if (cleanUpdates.calendarIds) {
             const remapped: Record<string, boolean> = {};
             for (const [calId, v] of Object.entries(cleanUpdates.calendarIds)) {
@@ -806,7 +815,7 @@ export const useCalendarStore = create<CalendarStore>()(
           // Escape per RFC 6901 (JSON Pointer): ~ → ~0, / → ~1
           const escapedId = participantId.replace(/~/g, '~0').replace(/\//g, '~1');
           const patchKey = `participants/${escapedId}/participationStatus`;
-          const patch: Record<string, unknown> = { [patchKey]: status };
+          let patch: Record<string, unknown> = { [patchKey]: status };
           // Stalwart routes the iTIP REPLY to the stored ORGANIZER
           // (organizerCalendarAddress); the RFC 8984 replyTo property is retired
           // in jscalendarbis and ignored. Repair events that are missing the
@@ -815,9 +824,12 @@ export const useCalendarStore = create<CalendarStore>()(
           if (replyTo?.imip && storeEvent && !storeEvent.organizerCalendarAddress) {
             patch.organizerCalendarAddress = replyTo.imip;
           }
+
+          const {cleanUpdates} = await calendarHooks.onBeforeEventUpdate.transform({cleanUpdates: sanitizeOutgoingCalendarEventData({ ...patch }), realId});
+
           await client.updateCalendarEvent(
             realId,
-            patch as unknown as Partial<CalendarEvent>,
+            cleanUpdates as unknown as Partial<CalendarEvent>,
             true,
             targetAccountId
           );
@@ -921,7 +933,7 @@ export const useCalendarStore = create<CalendarStore>()(
         }
 
         // Prepare all events for batch creation
-        const prepared: Partial<CalendarEvent>[] = [];
+        let prepared: Partial<CalendarEvent>[] = [];
         for (const event of eventsToProcess) {
           const src = sanitizeOutgoingCalendarEventData(event as Partial<CalendarEvent>);
           let cleanParticipants: Record<string, CalendarParticipant> | null = null;
@@ -996,7 +1008,7 @@ export const useCalendarStore = create<CalendarStore>()(
           });
           prepared.push(data);
         }
-
+        prepared = await calendarHooks.onBeforeEventsImport.transform(prepared);
         if (prepared.length === 0) return linked;
 
         // Batch create in chunks of 50 to avoid oversized requests
