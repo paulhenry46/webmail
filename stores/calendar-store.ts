@@ -1008,7 +1008,7 @@ export const useCalendarStore = create<CalendarStore>()(
           });
           prepared.push(data);
         }
-        prepared = await calendarHooks.onBeforeEventsImport.transform(prepared);
+        prepared = (await calendarHooks.onBeforeEventsImport.transform({prepared, targetAccountId})).prepared;
         if (prepared.length === 0) return linked;
 
         // Batch create in chunks of 50 to avoid oversized requests
