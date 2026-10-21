@@ -741,11 +741,11 @@ export const useCalendarStore = create<CalendarStore>()(
         refetchVisibleRange = () => get().fetchEvents(client, start, end, { silent: true });
         set(options?.silent ? { error: null } : { isLoadingEvents: true, error: null });
         try {
-          const rawEvents = await client.queryAllCalendarEvents({
+          const filter = await calendarHooks.onBeforeFetchEvents.transform({
             after: start,
             before: end,
-          });
-          if (currentStoreEpoch() !== epoch) return;
+          })
+          const rawEvents = await client.queryAllCalendarEvents(filter);
           // Filter out malformed events missing required 'start' field, or
           // whose start string fails to parse (would otherwise crash format()
           // calls in the rendering path - #316).
@@ -757,7 +757,7 @@ export const useCalendarStore = create<CalendarStore>()(
           // without synthetic-id support (lib/recurrence-instances.ts) or one
           // that ignores expandRecurrences. Occurrences the server already
           // expanded pass through untouched.
-          const events = expandRecurringEvents(validEvents, start, end);
+          let events = expandRecurringEvents(validEvents, start, end);
           debug.log('calendar', 'Calendar fetchEvents completed', {
             start,
             end,
@@ -766,6 +766,7 @@ export const useCalendarStore = create<CalendarStore>()(
             expandedCount: events.length,
             droppedEvents,
           });
+          events  = await calendarHooks.onAfterFetchEvents.transform(events);
           if (droppedEvents > 0) {
             debug.warn('calendar', 'Calendar fetchEvents dropped malformed events without a start field', { droppedEvents });
           }
@@ -821,10 +822,14 @@ export const useCalendarStore = create<CalendarStore>()(
         refetchVisibleRange = () => get().fetchAllAccountsEvents(accounts, start, end, { silent: true });
         set(options?.silent ? { error: null } : { isLoadingEvents: true, error: null });
         try {
+          const filter = await calendarHooks.onBeforeFetchEvents.transform({
+            after: start,
+            before: end,
+          })
           const results = await Promise.all(
             accounts.map(async ({ client, localAccountId }) => {
               try {
-                const raw = await client.queryAllCalendarEvents({ after: start, before: end });
+                const raw = await client.queryAllCalendarEvents(filter);
                 const valid = raw.filter(e =>
                   typeof e.start === 'string' && e.start && !isNaN(parseISO(e.start).getTime())
                 );
@@ -837,7 +842,8 @@ export const useCalendarStore = create<CalendarStore>()(
             }),
           );
           if (currentStoreEpoch() !== epoch) return;
-          set({ events: results.flat(), isLoadingEvents: false, dateRange: { start, end } });
+          const events = await calendarHooks.onAfterFetchEvents.transform(results.flat());
+          set({ events: events, isLoadingEvents: false, dateRange: { start, end } });
         } catch (error) {
           if (currentStoreEpoch() !== epoch) return;
           debug.error('Failed to fetch all-account events:', error);
@@ -856,7 +862,7 @@ export const useCalendarStore = create<CalendarStore>()(
           // server's client when in multi-account Pro mode.
           let targetAccountId = event.accountId;
           let localAccountId = event.localAccountId;
-          const cleanEvent = sanitizeOutgoingCalendarEventData({ ...event });
+          const cleanEvent = await calendarHooks.onBeforeEventCreate.transform(sanitizeOutgoingCalendarEventData({ ...event }));
           if (event.calendarIds) {
             const remapped: Record<string, boolean> = {};
             for (const calId of Object.keys(event.calendarIds)) {
@@ -961,7 +967,8 @@ export const useCalendarStore = create<CalendarStore>()(
             updateKeys: Object.keys(updates),
           });
           // Remap namespaced calendarIds back to original IDs
-          const cleanUpdates = sanitizeOutgoingCalendarEventData(withInstanceTimeZone(storeEvent, { ...updates }));
+          const {cleanUpdates} = await calendarHooks.onBeforeEventUpdate.transform({cleanUpdates: sanitizeOutgoingCalendarEventData({ ...updates }), realId});
+
           if (cleanUpdates.calendarIds) {
             const remapped: Record<string, boolean> = {};
             for (const [calId, v] of Object.entries(cleanUpdates.calendarIds)) {
@@ -1064,12 +1071,14 @@ export const useCalendarStore = create<CalendarStore>()(
             if (replyTo?.imip && storeEvent && !storeEvent.organizerCalendarAddress) {
               patch.organizerCalendarAddress = replyTo.imip;
             }
-            await client.updateCalendarEvent(
-              realId,
-              patch as unknown as Partial<CalendarEvent>,
-              true,
-              targetAccountId
-            );
+          const {cleanUpdates} = await calendarHooks.onBeforeEventUpdate.transform({cleanUpdates: sanitizeOutgoingCalendarEventData({ ...patch }), realId});
+
+          await client.updateCalendarEvent(
+            realId,
+            cleanUpdates as unknown as Partial<CalendarEvent>,
+            true,
+            targetAccountId
+          );
           }
           set((state) => ({
             events: state.events.map(e => {

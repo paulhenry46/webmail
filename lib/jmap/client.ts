@@ -7145,6 +7145,23 @@ export class JMAPClient implements IJMAPClient {
     }
   }
 
+  private hasTimeBounds(filter: CalendarEventFilter): boolean {
+    let hasAfter = false;
+    let hasBefore = false;
+
+    const traverse = (node: CalendarEventFilter) => {
+      if ('operator' in node) {
+        node.conditions.forEach(traverse);
+      } else {
+        if (node.after) hasAfter = true;
+        if (node.before) hasBefore = true;
+      }
+    };
+
+    traverse(filter);
+    return hasAfter && hasBefore;
+  }
+
   async queryCalendarEvents(
     filter: CalendarEventFilter,
     sort?: Array<{ property: string; isAscending: boolean }>,
