@@ -38,7 +38,7 @@ const mockCreds = getStalwartCredentials as unknown as Mock;
 type RouteResponse = { status: number; headers: Headers; body: unknown; json?: () => Promise<unknown> };
 
 function makeReq(body: unknown): Parameters<typeof POST>[0] {
-  return { json: async () => body } as unknown as Parameters<typeof POST>[0];
+  return { method: 'POST', headers: new Headers(), json: async () => body } as unknown as Parameters<typeof POST>[0];
 }
 
 function ics(status = 200, headers: Record<string, string> = {}) {
@@ -74,6 +74,31 @@ describe('POST /api/fetch-ical', () => {
       guardedFetch.mockResolvedValueOnce(new Response(bigBody, { status: 200, headers: { 'content-type': 'text/calendar' } }));
       const res = (await POST(makeReq({ url: 'https://calendar.example.com/feed.ics' }))) as unknown as RouteResponse;
       expect(res.status).toBe(200);
+    });
+
+    it('stops reading a chunked body at the cap instead of buffering it whole', async () => {
+      // No Content-Length: the body streams. It used to be read to the end
+      // and measured afterwards, so a feed that keeps streaming for the
+      // whole timeout grew the process by whatever arrived.
+      vi.stubEnv('ICAL_MAX_BYTES', String(64 * 1024));
+      const chunk = new Uint8Array(16 * 1024).fill(88);
+      let pulled = 0;
+      let cancelled = false;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          pulled++;
+          controller.enqueue(chunk);
+        },
+        cancel() {
+          cancelled = true;
+        },
+      });
+      guardedFetch.mockResolvedValueOnce(new Response(body, { status: 200, headers: { 'content-type': 'text/calendar' } }));
+      const res = (await POST(makeReq({ url: 'https://calendar.example.com/feed.ics' }))) as unknown as RouteResponse;
+      expect(res.status).toBe(413);
+      expect(cancelled).toBe(true);
+      // Five chunks cross the 64 KiB cap; a handful more may be in flight.
+      expect(pulled).toBeLessThan(12);
     });
 
     it('honours ICAL_MAX_BYTES to lower the cap via content-length', async () => {

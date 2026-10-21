@@ -3,15 +3,35 @@ import { configManager } from '@/lib/admin/config-manager';
 import { requireAdminAuth, getClientIP } from '@/lib/admin/session';
 import { auditLog } from '@/lib/admin/audit';
 import { logger } from '@/lib/logger';
-import type { SettingsPolicy } from '@/lib/admin/types';
+import { POLICY_SCOPE_HEADER, type SettingsPolicy } from '@/lib/admin/types';
+import { canSeeInstanceDetails } from '@/lib/auth/instance-details';
+import { configReadOnlyResponse } from '@/lib/admin/config-read-only-response';
 
 /**
- * GET /api/admin/policy - Get settings policy (NOT admin-protected - users read this)
+ * GET /api/admin/policy - Get settings policy (NOT admin-protected - users read this;
+ * visitors who are not signed in get the subset the login page needs)
  */
-export async function GET() {
+export async function GET(request: NextRequest) {
   try {
     await configManager.ensureLoaded();
     const policy = configManager.getPolicy();
+    if (!(await canSeeInstanceDetails(request))) {
+      // The login page needs the theme policy and gates; the plugin lists,
+      // push relays and sidebar app URLs map the deployment and are only
+      // used after signing in, when the client fetches the policy again.
+      return NextResponse.json(
+        {
+          ...policy,
+          forceEnabledPlugins: [],
+          approvedPlugins: [],
+          pushRelays: [],
+          pushRelayUrl: '',
+          pushRelayUrlLocked: false,
+          defaultSidebarApps: [],
+        },
+        { headers: { 'Cache-Control': 'no-store', [POLICY_SCOPE_HEADER]: 'public' } },
+      );
+    }
     return NextResponse.json(policy, {
       headers: { 'Cache-Control': 'no-store' },
     });
@@ -43,6 +63,9 @@ export async function PUT(request: NextRequest) {
     if (policy.features && typeof policy.features !== 'object') {
       return NextResponse.json({ error: 'features must be an object' }, { status: 400 });
     }
+    if (policy.defaults !== undefined && (typeof policy.defaults !== 'object' || policy.defaults === null || Array.isArray(policy.defaults))) {
+      return NextResponse.json({ error: 'defaults must be an object' }, { status: 400 });
+    }
     if (policy.themePolicy && typeof policy.themePolicy !== 'object') {
       return NextResponse.json({ error: 'themePolicy must be an object' }, { status: 400 });
     }
@@ -59,6 +82,8 @@ export async function PUT(request: NextRequest) {
 
     return NextResponse.json({ ok: true });
   } catch (error) {
+    const readOnly = configReadOnlyResponse(error);
+    if (readOnly) return readOnly;
     logger.error('Policy update error', { error: error instanceof Error ? error.message : 'Unknown error' });
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }

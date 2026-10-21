@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useTranslations } from 'next-intl';
 import { useSettingsStore } from '@/stores/settings-store';
 import { SettingsSection, SettingItem, ToggleSwitch, Select } from './settings-section';
@@ -11,6 +11,7 @@ import { Loader2, RefreshCw, Volume2, XCircle } from '@/components/icons';
 import { usePolicyStore } from '@/stores/policy-store';
 import { useAuthStore } from '@/stores/auth-store';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { MultiAccountPushSettings } from './multi-account-push';
 import { useConfirmDialog } from '@/hooks/use-confirm-dialog';
 import {
   WebPushUnsupportedError,
@@ -20,6 +21,7 @@ import {
   isWebPushSupported,
   listPushDevices,
   revokePushDevice,
+  serverSupportsEmailPush,
 } from '@/lib/web-push';
 import type { PushDevice } from '@/lib/web-push';
 import { IS_LITE } from '@/lib/lite';
@@ -43,13 +45,15 @@ type DevicesState =
 
 export function NotificationSettings() {
   const t = useTranslations('settings.notifications');
+  const tAppearance = useTranslations('settings.appearance');
   const {
     emailNotificationsEnabled,
     emailNotificationSound,
     notificationSoundChoice,
+    pushNotifyInboxOnly,
     calendarNotificationsEnabled,
     calendarNotificationSound,
-    calendarInvitationParsingEnabled,
+    faviconUnreadBadge,
     pushRelayUrl,
     updateSetting,
   } = useSettingsStore();
@@ -61,6 +65,9 @@ export function NotificationSettings() {
   const { dialogProps: confirmDialogProps, confirm: confirmDialog } = useConfirmDialog();
 
   const supported = typeof window !== 'undefined' && isWebPushSupported();
+  // "Inbox only" is enforced by the server's emailPush filter; without that
+  // capability (Stalwart < 0.16.16) the toggle would do nothing.
+  const inboxOnlyAvailable = supported && !!client && serverSupportsEmailPush(client);
   const [pushStatus, setPushStatus] = useState<PushStatus>(
     supported ? { kind: 'idle' } : { kind: 'unsupported' },
   );
@@ -75,16 +82,37 @@ export function NotificationSettings() {
   const activeRelayLabel =
     relayOptions.find((option) => option.url === activeRelayUrl)?.label ?? activeRelayUrl;
 
+  const busy = pushStatus.kind === 'busy';
+
   useEffect(() => {
     if (!supported) return;
     if (!client) return;
     const accountId = client.getAccountId();
     if (!accountId) return;
-    void (async () => {
-      const enabled = await isWebPushEnabled(accountId);
-      setPushStatus(enabled ? { kind: 'enabled' } : { kind: 'idle' });
-    })();
-  }, [supported, client]);
+    let cancelled = false;
+    const refreshStatus = async () => {
+      try {
+        const enabled = await isWebPushEnabled(accountId);
+        if (!cancelled) {
+          setPushStatus(enabled ? { kind: 'enabled' } : { kind: 'idle' });
+        }
+      } catch {
+        if (!cancelled) setPushStatus({ kind: 'idle' });
+      }
+    };
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void refreshStatus();
+    };
+    if (pushStatus.kind === 'busy' || pushStatus.kind === 'error') return;
+    void refreshStatus();
+    window.addEventListener('focus', onVisible);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      cancelled = true;
+      window.removeEventListener('focus', onVisible);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [supported, client, pushStatus.kind]);
 
   // The device list is worth loading even when push is off on this browser -
   // revoking a stale registration left on another device is exactly what you
@@ -103,7 +131,6 @@ export function NotificationSettings() {
     void refreshDevices();
   }, [refreshDevices]);
 
-  const busy = pushStatus.kind === 'busy';
   const pushEnabled = pushStatus.kind === 'enabled';
   // In the static Lite build push is off by design (no service worker, see
   // components/service-worker-registration.tsx), not a browser limitation.
@@ -130,6 +157,8 @@ export function NotificationSettings() {
         relayBaseUrl: activeRelayUrl,
         accountLabel: username ?? undefined,
         forceRecreate,
+        inboxOnly: pushNotifyInboxOnly,
+        mutes: useSettingsStore.getState().notificationMutes,
       });
       setPushStatus({ kind: 'enabled' });
     } catch (err) {
@@ -145,6 +174,49 @@ export function NotificationSettings() {
       await refreshDevices();
     }
   };
+
+  // Flipping "Inbox only" only writes the setting; the server-side JMAP push
+  // filter stays stale until the next app launch runs resyncWebPush. When push
+  // is already on for this device, re-run the enable flow now so the toggle
+  // takes effect immediately instead of "on next restart". The ref seeds to the
+  // mounted value so this never fires on mount or on an unrelated re-render.
+  const lastSyncedInboxOnly = useRef(pushNotifyInboxOnly);
+  useEffect(() => {
+    if (lastSyncedInboxOnly.current === pushNotifyInboxOnly) return;
+    lastSyncedInboxOnly.current = pushNotifyInboxOnly;
+    // Push off on this device: enabling it later builds the filter from the
+    // current setting, so there's nothing to re-sync now.
+    if (!client || pushStatus.kind !== 'enabled') return;
+
+    let cancelled = false;
+    setPushStatus({ kind: 'busy' });
+    void enableWebPush({
+      client,
+      relayBaseUrl: activeRelayUrl,
+      accountLabel: username ?? undefined,
+      inboxOnly: pushNotifyInboxOnly,
+      mutes: useSettingsStore.getState().notificationMutes,
+    })
+      .then(() => { if (!cancelled) setPushStatus({ kind: 'enabled' }); })
+      .catch((err) => {
+        if (cancelled) return;
+        if (err instanceof WebPushUnsupportedError) {
+          setPushStatus({ kind: 'unsupported' });
+          return;
+        }
+        setPushStatus({
+          kind: 'error',
+          message: err instanceof Error ? err.message : 'Failed to update push filter',
+        });
+      })
+      .finally(() => { if (!cancelled) void refreshDevices(); });
+    return () => { cancelled = true; };
+    // Only the setting flip should trigger a re-sync. client / relay / username
+    // are read live from the recreated closure; depending on pushStatus.kind
+    // here would re-fire the effect on the busy->enabled transition it causes
+    // and cancel its own in-flight call (leaving the row stuck on "Working").
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pushNotifyInboxOnly]);
 
   const handleDisablePush = async () => {
     if (!client) return;
@@ -210,7 +282,109 @@ export function NotificationSettings() {
 
   return (
     <div className="space-y-8">
-      <SettingsSection title={t('push.title')} description={t('push.description')}>
+      <SettingsSection id="mail" title={t('email.title')} description={t('email.description')}>
+        {!isSettingHidden('emailNotificationsEnabled') && (
+        <SettingItem
+          label={t('email.enabled')}
+          description={t('email.enabled_desc')}
+          locked={isSettingLocked('emailNotificationsEnabled')}
+        >
+          <ToggleSwitch
+            checked={emailNotificationsEnabled}
+            onChange={(checked) => updateSetting('emailNotificationsEnabled', checked)}
+          />
+        </SettingItem>
+        )}
+
+        <SettingItem
+          label={t('email.sound')}
+          description={t('email.sound_desc')}
+        >
+          <ToggleSwitch
+            checked={emailNotificationSound}
+            onChange={(checked) => updateSetting('emailNotificationSound', checked)}
+            disabled={!emailNotificationsEnabled}
+          />
+        </SettingItem>
+
+        {inboxOnlyAvailable && !isSettingHidden('pushNotifyInboxOnly') && (
+        <SettingItem
+          label={t('email.inbox_only')}
+          description={t('email.inbox_only_desc')}
+          locked={isSettingLocked('pushNotifyInboxOnly')}
+        >
+          <ToggleSwitch
+            checked={pushNotifyInboxOnly}
+            onChange={(checked) => updateSetting('pushNotifyInboxOnly', checked)}
+            disabled={!emailNotificationsEnabled}
+          />
+        </SettingItem>
+        )}
+
+        {/* The tab/app icon badge is a new-mail signal too; people look for it here. */}
+        <SettingItem label={tAppearance('favicon_unread_badge.label')} description={tAppearance('favicon_unread_badge.description')}>
+          <ToggleSwitch
+            checked={faviconUnreadBadge}
+            onChange={(checked) => updateSetting('faviconUnreadBadge', checked)}
+          />
+        </SettingItem>
+      </SettingsSection>
+
+      <SettingsSection id="calendar" title={t('calendar.title')} description={t('calendar.description')}>
+        {!isSettingHidden('calendarNotificationsEnabled') && (
+        <SettingItem
+          label={t('calendar.enabled')}
+          description={t('calendar.enabled_desc')}
+          locked={isSettingLocked('calendarNotificationsEnabled')}
+        >
+          <ToggleSwitch
+            checked={calendarNotificationsEnabled}
+            onChange={(checked) => updateSetting('calendarNotificationsEnabled', checked)}
+          />
+        </SettingItem>
+        )}
+
+        <SettingItem
+          label={t('calendar.sound')}
+          description={t('calendar.sound_desc')}
+        >
+          <ToggleSwitch
+            checked={calendarNotificationSound}
+            onChange={(checked) => updateSetting('calendarNotificationSound', checked)}
+            disabled={!calendarNotificationsEnabled}
+          />
+        </SettingItem>
+      </SettingsSection>
+
+      <SettingsSection id="sound" title={t('sound_selection.title')} description={t('sound_selection.description')}>
+        <SettingItem
+          label={t('sound_selection.choose')}
+          description={t('sound_selection.choose_desc')}
+        >
+          <div className="flex items-center gap-2">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8"
+              onClick={() => playNotificationSound(notificationSoundChoice)}
+              title={t('test_sound')}
+            >
+              <Volume2 className="w-4 h-4" />
+            </Button>
+            <Select
+              value={notificationSoundChoice}
+              onChange={(value) => {
+                const choice = value as NotificationSoundChoice;
+                updateSetting('notificationSoundChoice', choice);
+                playNotificationSound(choice);
+              }}
+              options={soundOptions}
+            />
+          </div>
+        </SettingItem>
+      </SettingsSection>
+
+      <SettingsSection id="push" title={t('push.title')} description={t('push.description')}>
         <SettingItem label={t('push.enable')} description={statusDescription}>
           <div className="flex items-center gap-2">
             {pushEnabled && (
@@ -227,6 +401,7 @@ export function NotificationSettings() {
         </SettingItem>
 
         <SettingItem
+          advanced
           label={t('push.relay_label')}
           description={pushRelayLocked ? t('push.relay_locked_desc') : t('push.relay_desc')}
           locked={pushRelayLocked}
@@ -251,8 +426,10 @@ export function NotificationSettings() {
         )}
       </SettingsSection>
 
+      <MultiAccountPushSettings relayBaseUrl={activeRelayUrl} />
+
       {client && (
-        <SettingsSection title={t('push.devices_title')} description={t('push.devices_desc')}>
+        <SettingsSection id="devices" advanced title={t('push.devices_title')} description={t('push.devices_desc')}>
           <div className="flex items-center justify-between gap-2">
             <p className="text-xs text-muted-foreground">
               {devices.kind === 'loading' && t('push.devices_loading')}
@@ -304,96 +481,6 @@ export function NotificationSettings() {
           )}
         </SettingsSection>
       )}
-
-      <SettingsSection title={t('sound_selection.title')} description={t('sound_selection.description')}>
-        <SettingItem
-          label={t('sound_selection.choose')}
-          description={t('sound_selection.choose_desc')}
-        >
-          <div className="flex items-center gap-2">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="h-8 w-8"
-              onClick={() => playNotificationSound(notificationSoundChoice)}
-              title={t('test_sound')}
-            >
-              <Volume2 className="w-4 h-4" />
-            </Button>
-            <Select
-              value={notificationSoundChoice}
-              onChange={(value) => {
-                const choice = value as NotificationSoundChoice;
-                updateSetting('notificationSoundChoice', choice);
-                playNotificationSound(choice);
-              }}
-              options={soundOptions}
-            />
-          </div>
-        </SettingItem>
-      </SettingsSection>
-
-      <SettingsSection title={t('email.title')} description={t('email.description')}>
-        {!isSettingHidden('emailNotificationsEnabled') && (
-        <SettingItem
-          label={t('email.enabled')}
-          description={t('email.enabled_desc')}
-          locked={isSettingLocked('emailNotificationsEnabled')}
-        >
-          <ToggleSwitch
-            checked={emailNotificationsEnabled}
-            onChange={(checked) => updateSetting('emailNotificationsEnabled', checked)}
-          />
-        </SettingItem>
-        )}
-
-        <SettingItem
-          label={t('email.sound')}
-          description={t('email.sound_desc')}
-        >
-          <ToggleSwitch
-            checked={emailNotificationSound}
-            onChange={(checked) => updateSetting('emailNotificationSound', checked)}
-            disabled={!emailNotificationsEnabled}
-          />
-        </SettingItem>
-      </SettingsSection>
-
-      <SettingsSection title={t('calendar.title')} description={t('calendar.description')}>
-        {!isSettingHidden('calendarNotificationsEnabled') && (
-        <SettingItem
-          label={t('calendar.enabled')}
-          description={t('calendar.enabled_desc')}
-          locked={isSettingLocked('calendarNotificationsEnabled')}
-        >
-          <ToggleSwitch
-            checked={calendarNotificationsEnabled}
-            onChange={(checked) => updateSetting('calendarNotificationsEnabled', checked)}
-          />
-        </SettingItem>
-        )}
-
-        <SettingItem
-          label={t('calendar.sound')}
-          description={t('calendar.sound_desc')}
-        >
-          <ToggleSwitch
-            checked={calendarNotificationSound}
-            onChange={(checked) => updateSetting('calendarNotificationSound', checked)}
-            disabled={!calendarNotificationsEnabled}
-          />
-        </SettingItem>
-
-        <SettingItem
-          label={t('calendar.invitation_parsing')}
-          description={t('calendar.invitation_parsing_desc')}
-        >
-          <ToggleSwitch
-            checked={calendarInvitationParsingEnabled}
-            onChange={(checked) => updateSetting('calendarInvitationParsingEnabled', checked)}
-          />
-        </SettingItem>
-      </SettingsSection>
 
       <ConfirmDialog {...confirmDialogProps} />
     </div>

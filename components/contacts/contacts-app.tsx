@@ -15,10 +15,12 @@ import { ContactGroupForm } from "@/components/contacts/contact-group-form";
 import { ContactGroupDetail } from "@/components/contacts/contact-group-detail";
 import { ContactsSidebar, type ContactCategory } from "@/components/contacts/contacts-sidebar";
 import { ContactImportDialog } from "@/components/contacts/contact-import-dialog";
+import { DirectoryBrowser, directoryKey } from "@/components/contacts/directory-browser";
+import { DirectoryEntryDetail } from "@/components/contacts/directory-entry-detail";
 import { RenameDialog } from "@/components/files/rename-dialog";
 import { exportContacts } from "@/components/contacts/contact-export";
 import { AppTopBannerSlot } from "@/components/plugins/app-top-banner-slot";
-import { useContactStore, getContactDisplayName, getContactPrimaryEmail } from "@/stores/contact-store";
+import { useContactStore, getContactDisplayName, getContactPrimaryEmail, type DirectoryEntry } from "@/stores/contact-store";
 import { savePendingMailto } from "@/lib/protocol-handlers/session";
 import { formatRecipient, formatRecipientEntry, type Recipient } from "@/lib/email-composer-utils";
 import { useAuthStore, redirectToLogin, saveRedirectAfterLogin } from '@/stores/auth-store';
@@ -43,6 +45,9 @@ import { consumePendingDeepLinkEntry, subscribePendingDeepLink } from "@/lib/dee
 import { useDeepLinkUrl } from "@/hooks/use-deep-link-url";
 import { useProInterfaceActive } from "@/components/pro/pro-interface-redirect";
 import { useLiteLinkSegments } from "@/hooks/use-lite-link-segments";
+import { useDocumentTitle } from "@/hooks/use-document-title";
+import { MvTopBar } from "@/components/layout/mv-top-bar";
+import { useMountainViewShell } from "@/hooks/use-mountain-view-shell";
 
 type View =
   | "list"
@@ -52,7 +57,8 @@ type View =
   | "group-detail"
   | "group-create"
   | "group-edit"
-  | "bulk-add-to-group";
+  | "bulk-add-to-group"
+  | "directory-detail";
 
 export interface ContactsAppProps {
   /** Path segments after `/contacts` (`['<contactId>', 'edit']`). */
@@ -63,6 +69,8 @@ function ContactsAppContent({ linkSegments: routeSegments }: ContactsAppProps = 
   // Static Lite build: the route params are empty, read the link from the URL.
   const linkSegments = useLiteLinkSegments('contacts', routeSegments);
   const t = useTranslations("contacts");
+  const tSidebar = useTranslations("sidebar");
+  useDocumentTitle(tSidebar("contacts"));
   const contactsEnabled = usePolicyStore((s) => s.isFeatureEnabled('contactsEnabled'));
   const { client, isAuthenticated, logout, checkAuth, isLoading: authLoading } = useAuthStore();
   const { showAppsModal, inlineApp, loadedApps, handleManageApps, handleInlineApp, closeInlineApp, closeAppsModal } = useSidebarApps();
@@ -74,6 +82,7 @@ function ContactsAppContent({ linkSegments: routeSegments }: ContactsAppProps = 
     selectedContactId,
     searchQuery,
     supportsSync,
+    contactsLoaded,
     selectedContactIds,
     setSelectedContact,
     setSearchQuery,
@@ -117,11 +126,17 @@ function ContactsAppContent({ linkSegments: routeSegments }: ContactsAppProps = 
   const [returnToEmail, setReturnToEmail] = useState(false);
   const [renamingKeyword, setRenamingKeyword] = useState<string | null>(null);
   const [selectedGroupId, setSelectedGroupId] = useState<string | null>(null);
+  const [directorySelection, setDirectorySelection] = useState<Set<string>>(() => new Set());
+  const [openDirectoryKey, setOpenDirectoryKey] = useState<string | null>(null);
+  const directoryPrincipals = useContactStore((s) => s.directoryPrincipals);
+  const showDirectory = !!client?.supportsPrincipals();
   const hasFetched = useRef(false);
   const { dialogProps: confirmDialogProps, confirm: confirmDialog } = useConfirmDialog();
   const isMobile = useIsMobile();
   const isDesktop = useIsDesktop();
   const isEmbedded = useIsEmbedded();
+  // Mountain View's desktop chrome: its top bar in place of the left rail.
+  const mvShell = useMountainViewShell(isEmbedded);
   const router = useRouter();
   const searchParams = useSearchParams();
   // One-shot intent flag: only consume the URL params on the first render that
@@ -283,7 +298,7 @@ function ContactsAppContent({ linkSegments: routeSegments }: ContactsAppProps = 
 
   // Contacts to display based on active category
   const displayedContacts = useMemo(() => {
-    if (activeCategory === "all") return individuals;
+    if (activeCategory === "all" || activeCategory === "directory") return individuals;
     if (activeCategory === "uncategorized") {
       return individuals.filter(c => !c.keywords || Object.keys(c.keywords).filter(k => c.keywords![k]).length === 0);
     }
@@ -304,9 +319,14 @@ function ContactsAppContent({ linkSegments: routeSegments }: ContactsAppProps = 
   const handleSelectCategory = useCallback((category: ContactCategory) => {
     setActiveCategory(category);
     clearSelection();
+    setDirectorySelection(new Set());
     if (typeof category === "object" && "groupId" in category) {
       setSelectedGroupId(category.groupId);
       setView("group-detail");
+    } else if (category === "directory") {
+      setSelectedGroupId(null);
+      setOpenDirectoryKey(null);
+      setView("list");
     } else {
       setSelectedGroupId(null);
     }
@@ -330,21 +350,23 @@ function ContactsAppContent({ linkSegments: routeSegments }: ContactsAppProps = 
   const handleDropContactsToCategory = useCallback(async (contactIds: string[], keyword: string) => {
     if (!client && supportsSync) return;
     try {
+      // Contacts in the category afterwards; a plugin may stop some updates.
+      let added = 0;
       for (const contactId of contactIds) {
         const contact = contacts.find(c => c.id === contactId);
         if (!contact) continue;
         const existingKeywords = contact.keywords || {};
-        if (existingKeywords[keyword]) continue; // already has this keyword
+        if (existingKeywords[keyword]) { added++; continue; } // already has this keyword
         const updatedKeywords = { ...existingKeywords, [keyword]: true };
-        if (supportsSync && client) {
-          await updateContact(client, contactId, { keywords: updatedKeywords });
-        } else {
-          updateLocalContact(contactId, { keywords: updatedKeywords });
-        }
+        const updated = supportsSync && client
+          ? await updateContact(client, contactId, { keywords: updatedKeywords })
+          : await updateLocalContact(contactId, { keywords: updatedKeywords });
+        if (updated !== false) added++;
       }
-      const msg = contactIds.length === 1
+      if (added === 0) return;
+      const msg = added === 1
         ? t("category_added", { name: keyword })
-        : t("category_added_plural", { count: contactIds.length, name: keyword });
+        : t("category_added_plural", { count: added, name: keyword });
       toast.success(msg);
     } catch (error) {
       console.error('Failed to add contacts to category:', error);
@@ -419,11 +441,11 @@ function ContactsAppContent({ linkSegments: routeSegments }: ContactsAppProps = 
     if (!confirmed) return;
 
     try {
-      if (supportsSync && client) {
-        await deleteContact(client, contactId);
-      } else {
-        deleteLocalContact(contactId);
-      }
+      const deleted = supportsSync && client
+        ? await deleteContact(client, contactId)
+        : await deleteLocalContact(contactId);
+      // A plugin stopped it and has told the user why.
+      if (!deleted) return;
       toast.success(t("toast.deleted"));
       if (selectedContactId === contactId) setView("list");
     } catch (error) {
@@ -460,33 +482,27 @@ function ContactsAppContent({ linkSegments: routeSegments }: ContactsAppProps = 
     const { id: _id, uid: _uid, created: _created, updated: _updated, ...rest } = source;
     void _id; void _uid; void _created; void _updated;
     const data: Partial<ContactCard> = JSON.parse(JSON.stringify(rest));
-    if (supportsSync && client) {
-      await createContact(client, data);
-      toast.success(t("toast.created"));
-    } else {
-      const localContact: ContactCard = {
+    const created = supportsSync && client
+      ? await createContact(client, data)
+      : await addLocalContact({
         id: `local-${generateUUID()}`,
         addressBookIds: data.addressBookIds || {},
         ...data,
-      };
-      addLocalContact(localContact);
-      toast.success(t("toast.created"));
-    }
+      });
+    if (created) toast.success(t("toast.created"));
   }, [supportsSync, client, createContact, addLocalContact, t]);
 
   const handleSaveNew = useCallback(async (data: Partial<ContactCard>) => {
-    if (supportsSync && client) {
-      await createContact(client, data);
-      toast.success(t("toast.created"));
-    } else {
-      const localContact: ContactCard = {
+    const created = supportsSync && client
+      ? await createContact(client, data)
+      : await addLocalContact({
         id: `local-${generateUUID()}`,
         addressBookIds: {},
         ...data,
-      };
-      addLocalContact(localContact);
-      toast.success(t("toast.created"));
-    }
+      });
+    // A plugin stopped it: keep the form open with what was typed.
+    if (!created) return;
+    toast.success(t("toast.created"));
     setDefaultBookIdForCreate(undefined);
     setCreatePrefill(undefined);
     if (returnToEmail) {
@@ -500,13 +516,11 @@ function ContactsAppContent({ linkSegments: routeSegments }: ContactsAppProps = 
   const handleSaveEdit = useCallback(async (data: Partial<ContactCard>) => {
     if (!selectedContact) return;
 
-    if (supportsSync && client) {
-      await updateContact(client, selectedContact.id, data);
-      toast.success(t("toast.updated"));
-    } else {
-      updateLocalContact(selectedContact.id, data);
-      toast.success(t("toast.updated"));
-    }
+    const updated = supportsSync && client
+      ? await updateContact(client, selectedContact.id, data)
+      : await updateLocalContact(selectedContact.id, data);
+    if (!updated) return;
+    toast.success(t("toast.updated"));
     setView("detail");
   }, [supportsSync, client, selectedContact, updateContact, updateLocalContact, t]);
 
@@ -596,6 +610,19 @@ function ContactsAppContent({ linkSegments: routeSegments }: ContactsAppProps = 
     };
     openComposeInApp([formatRecipientEntry(chip)], field);
   }, [getGroupMembers, t, openComposeInApp]);
+
+  const handleComposeDirectory = useCallback((entries: DirectoryEntry[]) => {
+    if (entries.length === 0) return;
+    openComposeInApp(entries.map((e) => formatRecipient(e.name !== e.email ? e.name : "", e.email)), "to");
+  }, [openComposeInApp]);
+
+  const handleAddDirectoryEntryToContacts = useCallback((entry: DirectoryEntry) => {
+    setCreatePrefill({ email: entry.email, name: entry.name !== entry.email ? entry.name : undefined });
+    setSelectedContact(null);
+    setDefaultBookIdForCreate(undefined);
+    setActiveCategory("all");
+    setView("create");
+  }, [setSelectedContact]);
 
   const handleComposeContact = useCallback((contact: ContactCard) => {
     const email = getContactPrimaryEmail(contact).trim();
@@ -694,10 +721,10 @@ function ContactsAppContent({ linkSegments: routeSegments }: ContactsAppProps = 
     if (!confirmed) return;
 
     try {
-      await bulkDeleteContacts(
+      if (!(await bulkDeleteContacts(
         supportsSync && client ? client : null,
         Array.from(selectedContactIds)
-      );
+      ))) return;
       toast.success(t("bulk.deleted", { count: selectedContactIds.size }));
       setView("list");
     } catch (error) {
@@ -742,6 +769,16 @@ function ContactsAppContent({ linkSegments: routeSegments }: ContactsAppProps = 
   if (!isAuthenticated) return null;
 
   const renderRightPanel = () => {
+    // The directory is read-only: its panel shows the open entry whatever the view.
+    if (activeCategory === "directory") {
+      return (
+        <DirectoryEntryDetail
+          entry={directoryPrincipals.find((e) => directoryKey(e) === openDirectoryKey) ?? null}
+          onCompose={(entry) => handleComposeDirectory([entry])}
+          onAddToContacts={handleAddDirectoryEntryToContacts}
+        />
+      );
+    }
     switch (view) {
       case "create":
         return <ContactForm addressBooks={addressBooks} allKeywords={allKeywords} defaultAddressBookId={defaultBookIdForCreate} prefill={createPrefill} onSave={handleSaveNew} onCancel={handleCancel} />;
@@ -893,12 +930,21 @@ function ContactsAppContent({ linkSegments: routeSegments }: ContactsAppProps = 
   };
 
   return (
-    <div className={cn("flex flex-col bg-background overflow-hidden pt-[env(safe-area-inset-top)]", isEmbedded ? "h-full" : "h-dvh")}>
+    <div className={cn("flex flex-col overflow-hidden pt-[env(safe-area-inset-top)]", mvShell ? "bg-[var(--mv-canvas)]" : "bg-background", isEmbedded ? "h-full" : "h-dvh")}>
       <AppTopBannerSlot />
       {refreshIndicator}
-      <div className={cn("flex flex-1 min-h-0 overflow-hidden", isMobile && "flex-col")}>
+      {mvShell && (
+        <MvTopBar
+          showMenuButton={false}
+          onManageApps={handleManageApps}
+          onInlineApp={handleInlineApp}
+          onCloseInlineApp={closeInlineApp}
+          activeAppId={inlineApp?.id ?? null}
+        />
+      )}
+      <div data-mv-card={mvShell ? "" : undefined} className={cn("flex flex-1 min-h-0 overflow-hidden", isMobile && "flex-col", mvShell && "mb-4 mx-4")}>
       {/* Navigation Rail - desktop only (hidden when embedded in Pro shell) */}
-      {!isMobile && !isEmbedded && (
+      {!isMobile && !isEmbedded && !mvShell && (
         <div className="w-14 bg-secondary flex flex-col flex-shrink-0" style={{ borderRight: '1px solid rgba(128, 128, 128, 0.3)' }}>
           <NavigationRail
             collapsed
@@ -991,6 +1037,7 @@ function ContactsAppContent({ linkSegments: routeSegments }: ContactsAppProps = 
                         }
                       } : undefined}
                       onRenameKeyword={(kw) => setRenamingKeyword(kw)}
+                      directoryCount={showDirectory ? directoryPrincipals.length : undefined}
                       multiAccountMode={multiAccountEnabled && accountClients.length > 1}
                     />
                   </div>
@@ -1018,6 +1065,35 @@ function ContactsAppContent({ linkSegments: routeSegments }: ContactsAppProps = 
                 )}
                 style={!isMobile ? { width: `${listWidth}px` } : undefined}
               >
+                {activeCategory === "directory" ? (
+                  <>
+                    <DirectoryBrowser
+                      client={client}
+                      selected={directorySelection}
+                      onSelectedChange={setDirectorySelection}
+                      onOpen={(entry) => { setOpenDirectoryKey(directoryKey(entry)); setView("directory-detail"); }}
+                      activeKey={openDirectoryKey}
+                      onMenuClick={isNarrow ? () => setNarrowSidebarOpen(true) : undefined}
+                      className="flex-1"
+                    />
+                    {directorySelection.size > 0 && (
+                      <div className="flex items-center gap-2 px-3 py-2 border-t border-border">
+                        <span className="text-xs text-muted-foreground me-auto tabular-nums">
+                          {t("directory.selected_count", { count: directorySelection.size })}
+                        </span>
+                        <Button size="sm" variant="ghost" onClick={() => setDirectorySelection(new Set())}>
+                          {t("bulk.clear")}
+                        </Button>
+                        <Button
+                          size="sm"
+                          onClick={() => handleComposeDirectory(directoryPrincipals.filter((e) => directorySelection.has(directoryKey(e))))}
+                        >
+                          {t("directory.write_email")}
+                        </Button>
+                      </div>
+                    )}
+                  </>
+                ) : (
                 <ContactList
                   contacts={displayedContacts}
                   selectedContactId={selectedContactId}
@@ -1038,7 +1114,9 @@ function ContactsAppContent({ linkSegments: routeSegments }: ContactsAppProps = 
                   onDeleteContact={handleDeleteContact}
                   onAddContactToGroup={handleAddContactToGroup}
                   onMenuClick={isNarrow ? () => setNarrowSidebarOpen(true) : undefined}
+                  isLoading={supportsSync && !contactsLoaded}
                 />
+                )}
               </div>
 
               {!isMobile && (

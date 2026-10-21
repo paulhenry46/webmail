@@ -17,8 +17,18 @@ const mocks = vi.hoisted(() => ({
     username: "alice@example.com",
     isAuthenticated: true,
     isDemoMode: false,
+    connectedAccountsRevision: 0,
+    // Login id -> client, as the auth store keeps it for the account switcher.
+    connected: new Map<string, { getAccountId: () => string }>(),
+    getAllConnectedClients: () => new Map(mocks.authState.connected),
   },
-  settingsState: { emailNotificationsEnabled: true, pushRelayUrl: "" },
+  accounts: [] as { id: string; username: string }[],
+  settingsState: {
+    emailNotificationsEnabled: true,
+    pushRelayUrl: "",
+    pushNotifyInboxOnly: false,
+    notificationMutes: { accounts: [] as string[], mailboxes: {} as Record<string, boolean> },
+  },
   policyState: {
     loaded: true,
     policy: {
@@ -34,14 +44,23 @@ vi.mock("next/navigation", () => ({
 }));
 
 vi.mock("@/stores/auth-store", () => ({
-  useAuthStore: (selector: (state: typeof mocks.authState) => unknown) =>
-    selector(mocks.authState),
+  useAuthStore: Object.assign(
+    (selector: (state: typeof mocks.authState) => unknown) =>
+      selector(mocks.authState),
+    { getState: () => mocks.authState },
+  ),
+}));
+
+vi.mock("@/stores/account-store", () => ({
+  useAccountStore: { getState: () => ({ accounts: mocks.accounts }) },
 }));
 
 vi.mock("@/stores/settings-store", () => ({
-  useSettingsStore: (
-    selector: (state: typeof mocks.settingsState) => unknown,
-  ) => selector(mocks.settingsState),
+  useSettingsStore: Object.assign(
+    (selector: (state: typeof mocks.settingsState) => unknown) =>
+      selector(mocks.settingsState),
+    { getState: () => mocks.settingsState },
+  ),
 }));
 
 vi.mock("@/stores/policy-store", () => ({
@@ -82,11 +101,15 @@ describe("PushNotificationPrompt", () => {
     mocks.supported = true;
     mocks.enabled = false;
     mocks.authState.client = { getAccountId: () => "account-1" };
+    mocks.authState.connectedAccountsRevision = 0;
+    mocks.authState.connected = new Map([["alice@mail.example.com", mocks.authState.client]]);
+    mocks.accounts = [{ id: "alice@mail.example.com", username: "alice@example.com" }];
     mocks.authState.username = "alice@example.com";
     mocks.authState.isAuthenticated = true;
     mocks.authState.isDemoMode = false;
     mocks.settingsState.emailNotificationsEnabled = true;
     mocks.settingsState.pushRelayUrl = "";
+    mocks.settingsState.notificationMutes = { accounts: [], mailboxes: {} };
     mocks.policyState.loaded = true;
     mocks.policyState.policy.pushRelayUrl =
       "https://notifications.relay.bulwarkmail.org";
@@ -124,6 +147,8 @@ describe("PushNotificationPrompt", () => {
       client: mocks.authState.client,
       relayBaseUrl: "https://notifications.relay.bulwarkmail.org",
       accountLabel: "alice@example.com",
+      inboxOnly: false,
+      mutes: { accounts: [], mailboxes: {} },
     });
     expect(screen.queryByText("title")).not.toBeInTheDocument();
   });
@@ -186,6 +211,88 @@ describe("PushNotificationPrompt", () => {
     );
     // Only the explicit Enable button may start the interactive flow.
     expect(mocks.enableWebPush).not.toHaveBeenCalled();
+  });
+
+  it("renews push for every connected login, not only the active one", async () => {
+    // Push for bob was enabled from the all-accounts panel; he never becomes
+    // the active account, so only this background pass keeps his
+    // registration from hitting the server's 7-day expiry.
+    const bob = { getAccountId: () => "account-2" };
+    mocks.authState.connected.set("bob@mail.example.com", bob);
+    mocks.accounts.push({ id: "bob@mail.example.com", username: "bob@example.com" });
+
+    render(<PushNotificationPrompt />);
+    await advancePromptDelay();
+
+    expect(mocks.resyncWebPush).toHaveBeenCalledTimes(2);
+    expect(mocks.resyncWebPush.mock.calls[0][0]).toMatchObject({
+      client: mocks.authState.client,
+      accountLabel: "alice@example.com",
+    });
+    expect(mocks.resyncWebPush.mock.calls[1][0]).toMatchObject({
+      client: bob,
+      accountLabel: "bob@example.com",
+      relayBaseUrl: "https://notifications.relay.bulwarkmail.org",
+    });
+  });
+
+  it("renews the other logins again when the tab returns to the foreground", async () => {
+    const bob = { getAccountId: () => "account-2" };
+    mocks.authState.connected.set("bob@mail.example.com", bob);
+    render(<PushNotificationPrompt />);
+    await advancePromptDelay();
+    mocks.resyncWebPush.mockClear();
+
+    await act(async () => {
+      document.dispatchEvent(new Event("visibilitychange"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mocks.resyncWebPush.mock.calls.map(([p]) => p.client)).toEqual([
+      mocks.authState.client,
+      bob,
+    ]);
+  });
+
+  it("reaches logins that finish connecting after the first pass", async () => {
+    const { rerender } = render(<PushNotificationPrompt />);
+    await advancePromptDelay();
+    expect(mocks.resyncWebPush).toHaveBeenCalledTimes(1);
+
+    // The background restore connects bob and bumps the revision.
+    const bob = { getAccountId: () => "account-2" };
+    mocks.authState.connected.set("bob@mail.example.com", bob);
+    mocks.authState.connectedAccountsRevision = 1;
+    rerender(<PushNotificationPrompt />);
+    await advancePromptDelay();
+
+    expect(mocks.resyncWebPush.mock.calls.map(([p]) => p.client)).toContain(bob);
+  });
+
+  it("sends a changed mute to every login right away, past the daily limit", async () => {
+    const bob = { getAccountId: () => "account-2" };
+    mocks.authState.connected.set("bob@mail.example.com", bob);
+    const { rerender } = render(<PushNotificationPrompt />);
+    await advancePromptDelay();
+    mocks.resyncWebPush.mockClear();
+
+    // An equal object from a settings sync is no change.
+    mocks.settingsState.notificationMutes = { accounts: [], mailboxes: {} };
+    rerender(<PushNotificationPrompt />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+    expect(mocks.resyncWebPush).not.toHaveBeenCalled();
+
+    const muted = { accounts: ["account-2"], mailboxes: {} };
+    mocks.settingsState.notificationMutes = muted;
+    rerender(<PushNotificationPrompt />);
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_000); });
+
+    expect(mocks.resyncWebPush).toHaveBeenCalledTimes(2);
+    for (const [params] of mocks.resyncWebPush.mock.calls) {
+      expect(params).toMatchObject({ mutes: muted, force: true });
+    }
+    expect(mocks.resyncWebPush.mock.calls.map(([p]) => p.client)).toContain(bob);
   });
 
   it("does not touch push in demo mode", async () => {

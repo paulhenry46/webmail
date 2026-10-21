@@ -49,15 +49,26 @@ if (isLite && (process.env.NEXT_PUBLIC_LOCALE_PREFIX ?? "never") !== "always") {
 
 const nextConfig: NextConfig = {
   output: isLite ? "export" : "standalone",
+  // No `X-Powered-By: Next.js` on every response.
+  poweredByHeader: false,
   // Directory-style pages (out/en/mail/index.html) are what static hosts and
   // the shipped SPA-fallback rules expect; next/image has no optimizer here.
   ...(isLite ? { trailingSlash: true, images: { unoptimized: true } } : {}),
   allowedDevOrigins: ["192.168.1.51"],
+  agentRules: false,
   basePath: basePath || undefined,
   // esbuild ships native binaries + a README the bundler can't parse; load
   // it from node_modules at runtime instead of trying to bundle it. Used by
   // PLUGIN_DEV_DIR's on-the-fly bundler.
   serverExternalPackages: ["esbuild"],
+  experimental: {
+    // proxy.ts runs for every request, /api included, and Next buffers the
+    // body for it up to this size and silently cuts off the rest. 10 MB (the
+    // default) truncated WOPI saves and WebDAV uploads of bigger files, and
+    // plugin uploads through /api/plugin-proxy. Keep MAX_PROXY_REQUEST_BYTES
+    // in lib/plugin-secrets/proxy.ts in step with it.
+    proxyClientMaxBodySize: "100mb",
+  },
   // Response headers are the host's job in a static export (see out/_headers).
   ...(isLite
     ? {}
@@ -76,15 +87,26 @@ const nextConfig: NextConfig = {
   // Sibling repos checked out under ./repos/ are unrelated source trees that
   // Turbopack's NFT can otherwise rope into the trace when dynamic fs calls
   // confuse it. Keeps the build from ballooning memory tracing dead code.
+  // The trace follows fs reads, and the runtime reads its state directories,
+  // so a build from a checkout that has been run would copy the admin
+  // password hash, the plugin signing key, the audit log and .env secrets
+  // into .next/standalone - and from there into the image.
+  // Only "./repos" goes under "*": that key also feeds the next-server trace,
+  // where Next matches each glob anywhere in the path, so "./data/**/*" would
+  // drop node_modules/next/dist/lib/metadata/* and the server would not start.
+  // "!(next-server)" matches every route but not that trace, and per route
+  // Next anchors the globs to the project root.
   outputFileTracingExcludes: {
     "*": ["./repos/**/*"],
+    "!(next-server)": ["./data/**/*", "./local-data/**/*", "./.env*"],
   },
   turbopack: {
-    root: import.meta.dirname,
+    root: process.env.NEXT_TURBOPACK_ROOT || import.meta.dirname,
   },
   env: {
     NEXT_PUBLIC_GIT_COMMIT: gitCommitHash,
-    NEXT_PUBLIC_APP_VERSION: appVersion,
+    // A dev server may announce another version, e.g. to try a plugin that needs the next release.
+    NEXT_PUBLIC_APP_VERSION: process.env.NEXT_PUBLIC_APP_VERSION || appVersion,
     NEXT_PUBLIC_BASE_PATH: basePath,
     NEXT_PUBLIC_DEV_MOCK_JMAP: process.env.DEV_MOCK_JMAP ?? "",
     NEXT_PUBLIC_BULWARK_LITE: isLite ? "1" : "",

@@ -1,11 +1,12 @@
 "use client";
 
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useMemo } from "react";
 import { useTranslations } from "next-intl";
 import { Mail, Phone, Building, MapPin, StickyNote, Pencil, Trash2, BookUser, Copy, Send, Globe, Cake, KeyRound, Users, Briefcase, Heart, Languages, Calendar, UserCircle, Download, MoreHorizontal, Printer } from "@/components/icons";
 import { Avatar } from "@/components/ui/avatar";
 import { MailtoLink } from "@/components/ui/mailto-link";
 import { Button } from "@/components/ui/button";
+import { ContextMenuItem, ContextMenuSeparator } from "@/components/ui/context-menu";
 import { cn } from "@/lib/utils";
 import type { ContactCard, AnniversaryDate, PartialDate } from "@/lib/jmap/types";
 import { getContactDisplayName, getContactPrimaryEmail, getContactPhotoUri } from "@/stores/contact-store";
@@ -15,6 +16,8 @@ import { exportContact } from "./contact-export";
 import { printContact } from "./contact-print";
 import { usePluginSlotOffers } from "@/hooks/use-plugin-slot-offers";
 import { PluginSlot } from "@/components/plugins/plugin-slot";
+import { contactHooks } from "@/lib/plugin-hooks";
+import { contactToView } from "@/lib/plugin-projection";
 
 type MoreItem =
   | {
@@ -38,9 +41,26 @@ interface ContactDetailProps {
   className?: string;
 }
 
-function formatPhoneFeatures(features?: Record<string, boolean>): string {
+// Contexts and phone features the contact form offers, shown with the same
+// labels here. Anything else (custom vCard types) is shown as stored.
+const CONTEXT_LABEL_KEYS: Record<string, string> = {
+  work: "form.context_work",
+  private: "form.context_private",
+};
+
+const PHONE_FEATURE_LABEL_KEYS: Record<string, string> = {
+  voice: "form.phone_voice",
+  cell: "form.phone_cell",
+  mobile: "form.phone_cell",
+  fax: "form.phone_fax",
+  pager: "form.phone_pager",
+  video: "form.phone_video",
+  text: "form.phone_text",
+};
+
+function formatPhoneFeatures(features: Record<string, boolean> | undefined, label: (key: string) => string): string {
   if (!features) return "";
-  return Object.keys(features).filter(k => features[k]).join(", ");
+  return Object.keys(features).filter(k => features[k]).map(label).join(", ");
 }
 
 function getDateParts(dateInput: AnniversaryDate): { year?: number; month?: number; day?: number } {
@@ -119,9 +139,22 @@ function formatDate(dateInput: AnniversaryDate): string {
 
 export function ContactDetail({ contact, onEdit, onDelete, onAddToGroup, onDuplicate, onCompose, isMobile, className }: ContactDetailProps) {
   const t = useTranslations("contacts");
+  const contextLabel = (key: string) => (CONTEXT_LABEL_KEYS[key] ? t(CONTEXT_LABEL_KEYS[key]) : key);
+  const featureLabel = (key: string) => (PHONE_FEATURE_LABEL_KEYS[key] ? t(PHONE_FEATURE_LABEL_KEYS[key]) : key);
 
   const cryptoKeys = contact?.cryptoKeys ? Object.values(contact.cryptoKeys) : [];
   const hasCryptoKeysSlotOffers = usePluginSlotOffers('contact-cryptokeys').length > 0;
+  const pluginContactProps = useMemo(() => (contact ? { contact: contactToView(contact) } : null), [contact]);
+
+  // Tell plugins once per contact shown here, not on every edit of that card.
+  const latestContact = useRef(contact);
+  useEffect(() => { latestContact.current = contact; });
+  const openedId = contact?.id;
+  useEffect(() => {
+    const opened = latestContact.current;
+    if (!openedId || !opened) return;
+    void contactHooks.onContactOpen.emit(contactToView(opened));
+  }, [openedId]);
 
   if (!contact) {
     return (
@@ -186,8 +219,8 @@ export function ContactDetail({ contact, onEdit, onDelete, onAddToGroup, onDupli
   return (
     <div className={cn("flex flex-col h-full overflow-y-auto", className)}>
       <div className={cn("border-b border-border", isMobile ? "px-4 py-4" : "px-6 py-6")}>
-        <div className={cn("flex gap-4", isMobile ? "flex-col" : "items-start justify-between")}>
-          <div className="flex items-center gap-4 min-w-0 flex-1">
+        <div className={cn("flex gap-4", isMobile ? "flex-col" : "flex-wrap items-start justify-between")}>
+          <div className="flex items-center gap-4 min-w-0 flex-1 basis-60">
             <Avatar name={name} email={email} contactPhotoUri={photoUri} size={isMobile ? "md" : "lg"} />
             <div className="min-w-0 flex-1">
               <h2 className={cn("font-semibold truncate", isMobile ? "text-lg" : "text-xl")}>{name || "-"}</h2>
@@ -234,7 +267,7 @@ export function ContactDetail({ contact, onEdit, onDelete, onAddToGroup, onDupli
           <Section title={t("detail.section_contact")}>
             <div className="space-y-3">
               {emails.map((e, i) => (
-                <FieldRow key={`em${i}`} icon={Mail} label={e.label || formatContexts(e.contexts) || t("detail.email_default_label")}>
+                <FieldRow key={`em${i}`} icon={Mail} label={e.label || formatContexts(e.contexts, contextLabel) || t("detail.email_default_label")}>
                   <div className="flex items-center gap-2 group">
                     <MailtoLink to={e.address} className="text-sm text-primary hover:underline break-all">
                       {e.address}
@@ -255,8 +288,8 @@ export function ContactDetail({ contact, onEdit, onDelete, onAddToGroup, onDupli
               ))}
 
               {phones.map((p, i) => {
-                const features = formatPhoneFeatures(p.features);
-                const labelParts = [p.label, formatContexts(p.contexts), features].filter(Boolean) as string[];
+                const features = formatPhoneFeatures(p.features, featureLabel);
+                const labelParts = [p.label, formatContexts(p.contexts, contextLabel), features].filter(Boolean) as string[];
                 return (
                   <FieldRow key={`ph${i}`} icon={Phone} label={labelParts.length ? labelParts.join(" · ") : t("detail.phone_default_label")}>
                     <div className="flex items-center gap-2 group">
@@ -285,7 +318,7 @@ export function ContactDetail({ contact, onEdit, onDelete, onAddToGroup, onDupli
                   lines.push(...parts);
                 }
                 return (
-                  <FieldRow key={`ad${i}`} icon={MapPin} label={formatContexts(a.contexts) || t("detail.address_default_label")}>
+                  <FieldRow key={`ad${i}`} icon={MapPin} label={formatContexts(a.contexts, contextLabel) || t("detail.address_default_label")}>
                     <div className="text-sm space-y-0.5">
                       {lines.map((line, idx) => (
                         <div key={idx}>{line}</div>
@@ -302,7 +335,7 @@ export function ContactDetail({ contact, onEdit, onDelete, onAddToGroup, onDupli
                 <FieldRow
                   key={`os${i}`}
                   icon={Globe}
-                  label={[svc.service, formatContexts(svc.contexts)].filter(Boolean).join(" · ") || t("detail.online_service_default_label")}
+                  label={[svc.service, formatContexts(svc.contexts, contextLabel)].filter(Boolean).join(" · ") || t("detail.online_service_default_label")}
                 >
                   <div className="flex items-center gap-2 group">
                     {typeof svc.uri === 'string' && svc.uri.startsWith("http") ? (
@@ -384,7 +417,7 @@ export function ContactDetail({ contact, onEdit, onDelete, onAddToGroup, onDupli
                 <FieldRow
                   key={`lg${i}`}
                   icon={Languages}
-                  label={formatContexts(lang.contexts) || t("detail.language_label")}
+                  label={formatContexts(lang.contexts, contextLabel) || t("detail.language_label")}
                 >
                   <div className="text-sm">{lang.language}</div>
                 </FieldRow>
@@ -496,6 +529,10 @@ export function ContactDetail({ contact, onEdit, onDelete, onAddToGroup, onDupli
           </Section>
         )}
 
+        {pluginContactProps && (
+          <PluginSlot name="contact-detail-section" className="w-full py-6" extraProps={pluginContactProps} />
+        )}
+
         <ContactActivity contact={contact} />
 
         {(contact.created || contact.updated) && (
@@ -509,9 +546,9 @@ export function ContactDetail({ contact, onEdit, onDelete, onAddToGroup, onDupli
   );
 }
 
-function formatContexts(contexts?: Record<string, boolean>): string {
+function formatContexts(contexts: Record<string, boolean> | undefined, label: (key: string) => string): string {
   if (!contexts) return "";
-  return Object.keys(contexts).filter(k => contexts[k]).join(", ");
+  return Object.keys(contexts).filter(k => contexts[k]).map(label).join(", ");
 }
 
 export function Section({ title, children, className }: { title: string; children: React.ReactNode; className?: string }) {
@@ -582,29 +619,23 @@ function MoreActionsMenu({ items, label }: { items: MoreItem[]; label: string })
       {open && (
         <div
           role="menu"
-          className="absolute end-0 top-full mt-1 z-30 min-w-[200px] rounded-md border border-border bg-popover text-popover-foreground shadow-lg py-1 animate-in fade-in-0 zoom-in-95 duration-100"
+          className="absolute end-0 top-full mt-1 z-30 min-w-[200px] bg-background rounded-md shadow-lg border border-border py-1"
         >
           {items.map((item, i) => {
             if (item.separator) {
-              return <div key={i} role="separator" className="my-1 h-px bg-border" />;
+              return <ContextMenuSeparator key={i} />;
             }
             return (
-              <button
+              <ContextMenuItem
                 key={i}
-                type="button"
-                role="menuitem"
+                icon={item.icon}
+                label={item.label}
+                destructive={item.destructive}
                 onClick={() => {
                   item.onClick();
                   setOpen(false);
                 }}
-                className={cn(
-                  "w-full flex items-center gap-2 px-3 py-1.5 text-sm text-start hover:bg-muted focus:bg-muted focus:outline-none transition-colors",
-                  item.destructive && "text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950 focus:bg-red-50 dark:focus:bg-red-950",
-                )}
-              >
-                <item.icon className={cn("w-4 h-4 flex-shrink-0", item.destructive ? "text-red-600 dark:text-red-400" : "text-muted-foreground")} />
-                <span className="flex-1">{item.label}</span>
-              </button>
+              />
             );
           })}
         </div>

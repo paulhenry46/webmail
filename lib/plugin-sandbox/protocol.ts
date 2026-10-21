@@ -11,10 +11,6 @@
 import type { SlotName, PluginTier } from '../plugin-types';
 import type { ThemeSnapshot } from './host-theme';
 
-// ─── Sandbox mode ────────────────────────────────────────────
-
-export type SandboxMode = 'background' | 'slot';
-
 /** Initialisation payload for a background-instance iframe (one per plugin). */
 export interface BackgroundInit {
   mode: 'background';
@@ -48,6 +44,12 @@ export interface SlotInit {
   tier: PluginTier;
   /** Slot name the iframe should render a component for. */
   slot: SlotName;
+  /**
+   * The frame fills its panel instead of growing with its content: the
+   * plugin's root is as tall as the panel and scrolls inside, so it can pin
+   * controls at the bottom (a chat input). Only for panel slots.
+   */
+  fill?: boolean;
   /** Same bundle code as the background instance. */
   code: string;
   /**
@@ -89,8 +91,8 @@ export interface InitDoneMsg {
   type: 'init-done';
   /** Hook names the plugin registered. The host installs proxy handlers. */
   hooks: string[];
-  /** Slots the plugin claims. Used by the host to know when a slot is offered. */
-  slots: Array<{ name: SlotName; hasShouldShow: boolean; order: number }>;
+  /** Slots the plugin claims. Used by the host to know when a slot is offered. `fill`: a panel slot that fills its panel (see slot-layout.ts). */
+  slots: Array<{ name: SlotName; hasShouldShow: boolean; order: number; fill?: boolean; startFolded?: boolean }>;
   /**
    * Keyboard shortcuts the plugin declares. The host installs a global
    * keydown listener that dispatches to the `shortcut:<id>` hook when the
@@ -139,12 +141,56 @@ export interface HookResultMsg {
 export interface SlotResizeMsg {
   type: 'slot-resize';
   height: number;
+  /** Natural content width, sent by inline slots (see slot-layout.ts). */
+  width?: number;
 }
 
 export interface SlotShouldShowResultMsg {
   type: 'slot-should-show-result';
   id: string;
   show: boolean;
+}
+
+export interface FloatingDropdownRect {
+  left: number;
+  top: number;
+  bottom: number;
+  width: number;
+  height: number;
+}
+
+export interface FloatingDropdownOption {
+  value: string;
+  label: string;
+  disabled?: boolean;
+}
+
+export interface FloatingDropdownOpenMsg {
+  type: 'floating-dropdown-open';
+  id: string;
+  rect: FloatingDropdownRect;
+  options: FloatingDropdownOption[];
+  multiple?: boolean;
+  selectedValues: string[];
+  singleValue?: string;
+  highlightedIndex: number;
+  ariaLabel?: string;
+}
+
+export interface FloatingDropdownUpdateMsg {
+  type: 'floating-dropdown-update';
+  id: string;
+  rect?: FloatingDropdownRect;
+  options?: FloatingDropdownOption[];
+  multiple?: boolean;
+  selectedValues?: string[];
+  singleValue?: string;
+  highlightedIndex?: number;
+}
+
+export interface FloatingDropdownCloseMsg {
+  type: 'floating-dropdown-close';
+  id: string;
 }
 
 export type SandboxToHost =
@@ -155,7 +201,10 @@ export type SandboxToHost =
   | CallbackInvokeMsg
   | HookResultMsg
   | SlotResizeMsg
-  | SlotShouldShowResultMsg;
+  | SlotShouldShowResultMsg
+  | FloatingDropdownOpenMsg
+  | FloatingDropdownUpdateMsg
+  | FloatingDropdownCloseMsg;
 
 // ─── Host → Sandbox messages ─────────────────────────────────
 
@@ -181,6 +230,9 @@ export interface LocaleChangeMsg { type: 'locale-change'; locale: string; }
 /** Host → sandbox: the resolved theme changed; re-inject the slot's theme CSS. */
 export interface ThemeChangeMsg { type: 'theme-change'; theme: ThemeSnapshot; }
 
+/** Host → sandbox: the user changed this plugin's settings. */
+export interface SettingsChangeMsg { type: 'settings-change'; settings: Record<string, unknown>; }
+
 export interface PropsUpdateMsg { type: 'props-update'; props: Record<string, unknown>; }
 
 export interface SlotShouldShowMsg {
@@ -190,38 +242,46 @@ export interface SlotShouldShowMsg {
   context: unknown;
 }
 
+/** Host → sandbox: a piece of a streamed api.proxy.fetch response. */
+export interface StreamChunkMsg { type: 'stream-chunk'; streamId: string; chunk: ArrayBuffer; }
+/** Host → sandbox: a streamed response ended (error set when it broke off). */
+export interface StreamEndMsg { type: 'stream-end'; streamId: string; error?: string; }
+/** Host → sandbox: upload progress of an api.proxy.fetch request. */
+export interface StreamProgressMsg { type: 'stream-progress'; streamId: string; loaded: number; total: number; }
+
+export interface FloatingDropdownSelectMsg {
+  type: 'floating-dropdown-select';
+  id: string;
+  option: FloatingDropdownOption;
+}
+
+export interface FloatingDropdownHighlightMsg {
+  type: 'floating-dropdown-highlight';
+  id: string;
+  index: number;
+}
+
+export interface FloatingDropdownDismissMsg {
+  type: 'floating-dropdown-dismiss';
+  id: string;
+}
+
 export type HostToSandbox =
   | InitMsg
+  | StreamChunkMsg
+  | StreamEndMsg
+  | StreamProgressMsg
   | ApiResponseMsg
   | CallbackResponseMsg
   | HookInvokeMsg
   | LocaleChangeMsg
   | ThemeChangeMsg
+  | SettingsChangeMsg
   | PropsUpdateMsg
-  | SlotShouldShowMsg;
-
-/** Marker used in extraProps for function values that the host owns. */
-export interface PluginCallbackMarker {
-  __pluginCallback: string;
-}
-
-export function isCallbackMarker(value: unknown): value is PluginCallbackMarker {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    typeof (value as { __pluginCallback?: unknown }).__pluginCallback === 'string'
-  );
-}
-
-// ─── Type guards ─────────────────────────────────────────────
-
-export function isSandboxMessage(value: unknown): value is SandboxToHost {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    typeof (value as { type?: unknown }).type === 'string'
-  );
-}
+  | SlotShouldShowMsg
+  | FloatingDropdownSelectMsg
+  | FloatingDropdownHighlightMsg
+  | FloatingDropdownDismissMsg;
 
 // ─── Constants ───────────────────────────────────────────────
 
@@ -236,29 +296,3 @@ export const SANDBOX_PATH = '/plugin-sandbox';
  * `proxy.ts`. Renders the identical `SandboxRuntime`.
  */
 export const SANDBOX_PRIVILEGED_PATH = '/plugin-sandbox-privileged';
-
-/** Methods callable by a plugin via api-request. Host enforces permissions. */
-export const API_METHODS = [
-  'storage.get', 'storage.set', 'storage.remove', 'storage.keys',
-  'http.post', 'http.fetch',
-  'crypto.createWebAuthn', 'crypto.getWebAuthn', 'crypto.getPublicKeys', 'crypto.createPublicKey', 'crypto.removePublicKey', 'crypto.getEncryptionAtRest', 'crypto.setEncryptionAtRest', 'crypto.getPublicKeyFromWKD',
-  'jmap.fetchBlob', 'jmap.uploadBlob', 'jmap.sendRaw',
-  // Narrow keyword helpers. Unlike the raw-blob methods, these are available
-  // to untrusted plugins with email:read/email:write as appropriate.
-  'jmap.getKeywords', 'jmap.setKeywords', 'jmap.setKeyword', 'jmap.removeKeyword',
-  'upfiles.get', 'upfiles.save',
-  'contact.get', 'contact.update', 'contact.create', 'contact.search',
-  'admin.getConfig', 'admin.getAllConfig', 'admin.setConfig', 'admin.deleteConfig',
-  'toast.success', 'toast.error', 'toast.info', 'toast.warning',
-  'ui.confirm', 'ui.alert', 'ui.prompt', 'ui.rerenderEmail', 'ui.rerenderFetchedEmails', 'ui.openExternalUrl', 'ui.downloadFile',
-  // Email keyword mutations (JMAP Email/set keyword patches).
-  'email.setKeyword', 'email.removeKeyword',
-  // Native tag definitions, discovery, and sidebar counts.
-  'keywords.list', 'keywords.add', 'keywords.reorder', 'keywords.discover', 'keywords.getCounts', 'keywords.refreshCounts',
-  // Message-list category tabs (Gmail-style inbox tabs).
-  'tabs.set', 'tabs.clear', 'tabs.getState', 'tabs.categorize', 'tabs.refreshCounts',
-  // Sieve integration for delivery-time classification plugins.
-  'sieve.isSupported', 'sieve.getActiveScript', 'sieve.validateScript', 'sieve.regenerate',
-] as const;
-
-export type ApiMethod = (typeof API_METHODS)[number];

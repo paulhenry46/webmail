@@ -118,7 +118,7 @@ describe('non-unified shared-folder batch action routing', () => {
         makeEmail({ id: 'e1', keywords: {}, mailboxIds: { 'owner-x:x-inbox': true } }),
         makeEmail({ id: 'e2', keywords: {}, mailboxIds: { 'owner-x:x-inbox': true } }),
       ],
-      selectedEmailIds: new Set(['e1', 'e2']),
+      selectedEmailKeys: new Set(['e1', 'e2']),
     });
   });
 
@@ -139,6 +139,22 @@ describe('non-unified shared-folder batch action routing', () => {
   it('batchMarkAsRead marks shared emails read on the owner account', async () => {
     await useEmailStore.getState().batchMarkAsRead(activeClient, true);
 
+    expect(activeClient.batchMarkAsRead).toHaveBeenCalledWith(['e1', 'e2'], true, 'owner-x');
+  });
+
+  it('markThreadAsRead marks a shared conversation read on the owner account', async () => {
+    // Opening a conversation in the shared inbox. Its ids belong to owner-x;
+    // the login's own account may hold unrelated messages with the same ids.
+    useEmailStore.setState({
+      emails: [
+        makeEmail({ id: 'e1', threadId: 'thread-1', keywords: {}, mailboxIds: { 'owner-x:x-inbox': true } }),
+        makeEmail({ id: 'e2', threadId: 'thread-1', keywords: {}, mailboxIds: { 'owner-x:x-inbox': true } }),
+      ],
+    });
+
+    await useEmailStore.getState().markThreadAsRead(activeClient, 'thread-1');
+
+    expect(activeClient.batchMarkAsRead).toHaveBeenCalledTimes(1);
     expect(activeClient.batchMarkAsRead).toHaveBeenCalledWith(['e1', 'e2'], true, 'owner-x');
   });
 
@@ -185,7 +201,7 @@ describe('non-unified shared-folder batch action routing', () => {
         makeEmail({ id: 'o1', keywords: {}, mailboxIds: { 'a-inbox': true } }),
         makeEmail({ id: 'o2', keywords: {}, mailboxIds: { 'a-inbox': true } }),
       ],
-      selectedEmailIds: new Set(['o1', 'o2']),
+      selectedEmailKeys: new Set(['o1', 'o2']),
     });
 
     await useEmailStore.getState().batchDelete(activeClient, false);

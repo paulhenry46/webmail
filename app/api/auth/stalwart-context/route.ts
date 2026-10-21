@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { logger } from '@/lib/logger';
-import { JmapAuthVerificationError, verifyJmapIdentity } from '@/lib/auth/verify-jmap-auth';
+import { JmapAuthVerificationError, resolveJmapIdentity } from '@/lib/auth/verify-jmap-auth';
 import { setStalwartAuthContext } from '@/lib/stalwart/auth-context';
 import { configManager } from '@/lib/admin/config-manager';
 import { isPublicHttpUrl } from '@/lib/security/url-guard';
@@ -8,6 +8,9 @@ import { recordLogin } from '@/lib/telemetry/login-tracker';
 import { parseJmapServers, resolveTrustedJmapUrl } from '@/lib/admin/jmap-servers';
 import { MAX_ACCOUNT_SLOTS } from '@/lib/account-utils';
 import { rejectCrossOriginRequest } from '@/lib/security/same-origin';
+import { insecureCookieHint, verificationFailureBody } from '@/lib/auth/verification-failure';
+import { loginClientAddress } from '@/lib/auth/client-address';
+import { LOGIN_BUDGET_RETRY_AFTER_SECONDS, reserveLoginAttempt } from '@/lib/auth/verify-budget';
 
 function getSlot(request: NextRequest, bodySlot: unknown): number {
   if (typeof bodySlot === 'number' && bodySlot >= 0 && bodySlot < MAX_ACCOUNT_SLOTS) {
@@ -26,6 +29,8 @@ export async function POST(request: NextRequest) {
   // so a cross-site top-level POST would otherwise reach this handler.
   const crossOrigin = rejectCrossOriginRequest(request);
   if (crossOrigin) return crossOrigin;
+  let upstreamUrl = '';
+  let upstreamTrusted = false;
   try {
     const { serverUrl, username, authHeader, slot: bodySlot } = await request.json();
 
@@ -46,8 +51,6 @@ export async function POST(request: NextRequest) {
     const serverList = parseJmapServers(configManager.get<unknown>('jmapServers', []));
     const trustedUrl = resolveTrustedJmapUrl(serverUrl, configuredServerUrl, serverList);
 
-    let upstreamUrl: string;
-    let upstreamTrusted: boolean;
     if (trustedUrl) {
       upstreamUrl = trustedUrl;
       upstreamTrusted = true;
@@ -70,22 +73,49 @@ export async function POST(request: NextRequest) {
     // any user's synced settings. Admin-configured servers are `trusted`,
     // which only relaxes the public-address requirement (they may live on a
     // private network) - never the credential check.
-    const normalizedServerUrl = await verifyJmapIdentity(upstreamUrl, authHeader, username, {
-      trusted: upstreamTrusted,
-    });
+    // Wrong credentials tried from here count against this server's address
+    // upstream, so each client gets a failure budget (lib/auth/verify-budget.ts).
+    const clientIp = loginClientAddress(request);
+    const refund = reserveLoginAttempt(clientIp);
+    if (!refund) {
+      return NextResponse.json(
+        { error: 'too_many_attempts', hint: 'Too many failed sign-in attempts. Try again later.' },
+        { status: 429, headers: { 'Retry-After': String(LOGIN_BUDGET_RETRY_AFTER_SECONDS) } },
+      );
+    }
+    let normalizedServerUrl: string;
+    let accountName: string;
+    try {
+      ({ serverUrl: normalizedServerUrl, accountName } = await resolveJmapIdentity(upstreamUrl, authHeader, username, {
+        trusted: upstreamTrusted,
+        clientIp,
+      }));
+    } catch (error) {
+      // Only a credential the server rejected spends the budget; an outage
+      // or a mismatched claim says nothing about the password.
+      if (!(error instanceof JmapAuthVerificationError && error.status === 401)) refund();
+      throw error;
+    }
+    refund();
 
     await setStalwartAuthContext(slot, {
       serverUrl: normalizedServerUrl,
       username,
       authHeader,
+      ...(accountName !== username ? { accountName } : {}),
     });
 
     void recordLogin(username, normalizedServerUrl);
 
-    return NextResponse.json({ ok: true });
+    const warning = insecureCookieHint(request);
+    if (warning) logger.warn(`stalwart-context: ${warning}`);
+    return NextResponse.json(warning ? { ok: true, warning } : { ok: true });
   } catch (error) {
     if (error instanceof JmapAuthVerificationError) {
-      return NextResponse.json({ error: error.message }, { status: error.status });
+      return NextResponse.json(
+        verificationFailureBody('stalwart-context', error, upstreamUrl, upstreamTrusted),
+        { status: error.status },
+      );
     }
 
     logger.error('Failed to store Stalwart auth context', {

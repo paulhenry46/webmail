@@ -1,49 +1,13 @@
 import type { ConfigData } from '@/hooks/use-config';
 import type { SettingsPolicy } from '@/lib/admin/types';
 import { DEFAULT_POLICY } from '@/lib/admin/types';
-
-/**
- * Runtime configuration for the static Lite build.
- *
- * `/api/config` used to merge env vars, the admin dashboard and per-host
- * branding on the server. Lite reads `config.json` instead: a deployer edits a
- * handful of keys (server URL, app name, logos) and everything else falls
- * back to the same defaults `useConfig` already assumes. Whatever the file
- * says, the flags that only work with a Next.js server behind them are forced
- * off so no surface ever calls an endpoint that does not exist.
- */
-
-/** Keys a deployer may set in config.json. Everything else is ignored. */
-export const LITE_CONFIG_KEYS = [
-  'appName',
-  'jmapServerUrl',
-  'allowCustomJmapEndpoint',
-  'jmapServers',
-  'jmapServerAutoPickByDomain',
-  'demoMode',
-  'rememberMeEnabled',
-  'faviconUrl',
-  'appLogoLightUrl',
-  'appLogoDarkUrl',
-  'loginLogoLightUrl',
-  'loginLogoDarkUrl',
-  'loginCompanyName',
-  'loginImprintUrl',
-  'loginPrivacyPolicyUrl',
-  'loginWebsiteUrl',
-  'loginLogoMaxHeight',
-  'loginLogoMaxWidth',
-  'loginShowHeading',
-  'loginShowSubtitle',
-  'loginShowTotp',
-  'loginShowVersion',
-  'embeddedMode',
-  'parentOrigin',
-] as const;
+import { httpUrlOrEmpty } from '@/lib/config-validation';
 
 /**
  * Flags that need the Next.js server (cookies, filesystem, OAuth relay). They
- * are pinned regardless of what config.json contains.
+ * are pinned regardless of what config.json contains. `oauthEnabled` is the
+ * server-relayed flow; Lite on Stalwart signs in through an OpenID provider
+ * on its own, decided per account at runtime (lib/auth/lite-oauth.ts).
  */
 export const LITE_FORCED_FLAGS = {
   oauthEnabled: false,
@@ -74,8 +38,9 @@ function trimUrl(value: string): string {
  * - `jmapServerUrl` is trimmed of trailing slashes.
  * - `allowCustomJmapEndpoint` defaults to *on* when no server is configured,
  *   so an unedited download still lets people type their server.
- * - `rememberMeEnabled` defaults to on; the login page still hides the box for
- *   servers without Stalwart's token login (see lib/auth/lite-tokens.ts).
+ * - `rememberMeEnabled` defaults to on, and sign-ins are remembered without
+ *   asking unless `loginShowRememberMe` shows the box. Servers without
+ *   Stalwart's token login are never remembered (see lib/auth/lite-tokens.ts).
  * - `defaults.jmapServerUrl` (the Stalwart build passes the page origin) fills
  *   an empty server URL, and the server field then stays hidden unless
  *   config.json explicitly allows it.
@@ -118,6 +83,8 @@ export function applyLiteConfig(raw: unknown, defaults?: { jmapServerUrl?: strin
     loginShowHeading: bool(input.loginShowHeading, true),
     loginShowSubtitle: bool(input.loginShowSubtitle, true),
     loginShowTotp: bool(input.loginShowTotp, true),
+    loginShowTokenLogin: bool(input.loginShowTokenLogin, false),
+    loginShowRememberMe: bool(input.loginShowRememberMe, false),
     loginShowVersion: bool(input.loginShowVersion, true),
     demoMode: bool(input.demoMode, false),
     allowCustomJmapEndpoint: bool(input.allowCustomJmapEndpoint, jmapServerUrl === '' && jmapServers.length === 0),
@@ -125,6 +92,7 @@ export function applyLiteConfig(raw: unknown, defaults?: { jmapServerUrl?: strin
     jmapServerAutoPickByDomain: bool(input.jmapServerAutoPickByDomain, false),
     embeddedMode: bool(input.embeddedMode, false),
     parentOrigin: str(input.parentOrigin, ''),
+    sourceCodeUrl: httpUrlOrEmpty(input.sourceCodeUrl),
     ...LITE_FORCED_FLAGS,
   };
 }
@@ -155,6 +123,9 @@ export function applyLitePolicy(raw: unknown): SettingsPolicy {
       pluginsEnabled: false,
       pluginsUploadEnabled: false,
       sidebarAppsEnabled: false,
+      // Kept by this app's server, which Lite does not have.
+      accountArchiveEnabled: false,
+      accountArchivePasswordsEnabled: false,
     },
     forceEnabledPlugins: [],
     approvedPlugins: [],

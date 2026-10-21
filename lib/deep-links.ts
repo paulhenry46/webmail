@@ -131,10 +131,14 @@ const VIRTUAL_ALIAS_BY_ID: Record<string, string> = Object.fromEntries(
 /** Mailbox roles that get a readable alias instead of their opaque JMAP id. */
 const ALIASED_ROLES = new Set(['inbox', 'sent', 'drafts', 'trash', 'archive', 'junk']);
 
+/**
+ * `accountId` is the local account (AccountEntry.id). `slot` names the
+ * login by its cookie slot instead - what a push notification knows.
+ */
 export type MailDeepLink =
-  | { kind: 'folder'; ref: string; accountId?: string }
-  | { kind: 'message'; id: string; accountId?: string; fullscreen?: boolean }
-  | { kind: 'thread'; id: string; accountId?: string };
+  | { kind: 'folder'; ref: string; accountId?: string; slot?: number }
+  | { kind: 'message'; id: string; accountId?: string; slot?: number; fullscreen?: boolean }
+  | { kind: 'thread'; id: string; accountId?: string; slot?: number };
 
 export interface MailLinkState {
   mailboxId: string | null;
@@ -186,6 +190,35 @@ export function resolveFolderRef(ref: string, mailboxes: Mailbox[] = []): string
   return decoded || null;
 }
 
+/** The parts of the mail list's state that decide what a folder link shows. */
+export interface OpenFolderView {
+  selectedMailbox: string;
+  isUnifiedView: boolean;
+  isScheduledView: boolean;
+  selectedKeyword: string | null;
+  hasSearch: boolean;
+}
+
+/**
+ * Whether a folder link names the plain folder the list already shows.
+ *
+ * The address bar carries the open folder (`buildMailPath`), so reloading the
+ * page hands that folder back as a link once the boot fetch has loaded it.
+ * Selecting it again would only fetch the same list a second time under the
+ * loading overlay. Virtual views are never "already open" at boot: the boot
+ * fetch does not load them.
+ */
+export function isFolderLinkOpen(mailboxId: string, view: OpenFolderView): boolean {
+  if (VIRTUAL_ALIAS_BY_ID[mailboxId]) return false;
+  return (
+    mailboxId === view.selectedMailbox &&
+    !view.isUnifiedView &&
+    !view.isScheduledView &&
+    !view.selectedKeyword &&
+    !view.hasSearch
+  );
+}
+
 /**
  * The canonical path for the current mail view. Returns `/mail` for the bare
  * list so the address bar stays clean when nothing is open.
@@ -201,6 +234,15 @@ export function buildMailPath(state: MailLinkState, mailboxes: Mailbox[] = []): 
 }
 
 /**
+ * Whether a real browser path (any mount or locale prefix) opens a folder
+ * link, `/mail/folder/<ref>`. Read before the shell renders, when only the
+ * address bar can tell a reload of a folder from a plain visit to the app.
+ */
+export function pathNamesMailFolder(pathname: string): boolean {
+  return /(?:^|\/)mail\/folder\/[^/]+/.test(pathname);
+}
+
+/**
  * Parses the segments after `/mail`. Also accepts the legacy `?email=<id>`
  * query the push service worker used to emit, so notifications from an older
  * installed worker keep opening the right message.
@@ -210,6 +252,9 @@ export function parseMailPath(
   search?: URLSearchParams,
 ): MailDeepLink | null {
   const accountId = search?.get('account') ?? undefined;
+  const rawSlot = search?.get('slot');
+  const slotNumber = rawSlot != null && rawSlot !== '' ? Number(rawSlot) : NaN;
+  const slot = Number.isInteger(slotNumber) && slotNumber >= 0 ? slotNumber : undefined;
   // `?view=fullscreen` asks for the message alone, no sidebar or list - what
   // a mail dragged out into a new browser tab opens as. The Pro shell always
   // opens message links as fullscreen email tabs and ignores the flag.
@@ -219,14 +264,14 @@ export function parseMailPath(
   if (kind && value) {
     const id = decodeSegment(value);
     if (id) {
-      if (kind === 'message') return { kind: 'message', id, accountId, fullscreen };
-      if (kind === 'thread') return { kind: 'thread', id, accountId };
-      if (kind === 'folder') return { kind: 'folder', ref: id, accountId };
+      if (kind === 'message') return { kind: 'message', id, accountId, slot, fullscreen };
+      if (kind === 'thread') return { kind: 'thread', id, accountId, slot };
+      if (kind === 'folder') return { kind: 'folder', ref: id, accountId, slot };
     }
   }
 
   const legacyEmail = search?.get('email');
-  if (legacyEmail) return { kind: 'message', id: legacyEmail, accountId };
+  if (legacyEmail) return { kind: 'message', id: legacyEmail, accountId, slot };
 
   return null;
 }
@@ -402,17 +447,27 @@ export function parseFilesPath(
 // Settings
 // ---------------------------------------------------------------------------
 
-export function buildSettingsPath(tabId: string | null | undefined): string {
-  return tabId ? `/settings/${encodeSegment(tabId)}` : '/settings';
+/** `/settings/<tab>`, or `/settings/<tab>/<section>` to land on one section of the page. */
+export function buildSettingsPath(tabId: string | null | undefined, section?: string | null): string {
+  if (!tabId) return '/settings';
+  const base = `/settings/${encodeSegment(tabId)}`;
+  return section ? `${base}/${encodeSegment(section)}` : base;
 }
 
 /**
- * The tab id from `/settings/<tab>`. Validation against the real tab registry
- * is the settings page's job - it owns the list and the legacy-id migration.
+ * The tab id from `/settings/<tab>[/<section>]`. Validation against the real
+ * tab registry is the settings page's job - it owns the list and the
+ * legacy-id migration.
  */
 export function parseSettingsPath(segments: string[] = []): string | null {
   const [tab] = segments;
   return tab ? decodeSegment(tab) : null;
+}
+
+/** The section id from `/settings/<tab>/<section>`, if the link names one. */
+export function parseSettingsSection(segments: string[] = []): string | null {
+  const [, section] = segments;
+  return section ? decodeSegment(section) : null;
 }
 
 // ---------------------------------------------------------------------------

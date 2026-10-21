@@ -1,18 +1,22 @@
 "use client";
 
-import { useState, useEffect, useMemo, useRef, useCallback } from "react";
+import React, { useState, useEffect, useLayoutEffect, useMemo, useRef, useCallback } from "react";
 import DOMPurify from "dompurify";
 import { Email, ThreadGroup } from "@/lib/jmap/types";
-import { EMAIL_SANITIZE_CONFIG, collapseBlockedImageContainers, plainTextToSafeHtml, restrictDataUriResourcesOnNode, sanitizePlainTextRenderedHtml } from "@/lib/email-sanitization";
+import { EMAIL_SANITIZE_CONFIG, blockExternalResourcesOnNode, collapseBlockedImageContainers, emailIframeCsp, plainTextToSafeHtml, restrictDataUriResourcesOnNode, sanitizeEmailBodyForIframe, sanitizePlainTextRenderedHtml } from "@/lib/email-sanitization";
+import { emailDisplayDate } from "@/lib/email-date";
 import { getRenderableHtmlBody } from "@/lib/email-body-selection";
-import { collectReferencedCids, isEmbeddedInBody } from "@/lib/attachment-visibility";
+import { findVerificationCode, verificationCodeBodyText } from "@/lib/verification-code";
+import { VerificationCodeChip } from "./verification-code-chip";
+import { collectReferencedCids, isEmbeddedInBody, normalizeCid } from "@/lib/attachment-visibility";
 import { collapsePlainTextQuotes, setupQuoteCollapse } from "@/lib/quote-collapse";
 import { fitEmailBodyWidth } from "@/lib/email-fit-width";
-import { transformInlineStyles, transformColorForDarkMode, transformBgColorForDarkMode } from "@/lib/color-transform";
+import { DARK_PENDING_CLASS, applyEmailDarkMode, emailDarkModeCss } from "@/lib/email-dark-mode";
 import { useThemeStore } from "@/stores/theme-store";
+import { useShallow } from "zustand/react/shallow";
 import { Avatar } from "@/components/ui/avatar";
 import { Button } from "@/components/ui/button";
-import { formatDate, formatFileSize, cn } from "@/lib/utils";
+import { formatDate, formatFileSize, cn, cleanPreview } from "@/lib/utils";
 import {
   ArrowLeft,
   ChevronDown,
@@ -35,8 +39,24 @@ import {
 import { useTranslations } from "next-intl";
 import { useSettingsStore } from "@/stores/settings-store";
 import { useContactStore } from "@/stores/contact-store";
+import { useEmailStore, resolveEmailBlobContext, type EmailBlobContext } from "@/stores/email-store";
 import { useAuthStore } from "@/stores/auth-store";
 import { isFilePreviewable, toInertBlob } from "@/lib/file-preview";
+import { useWopiStatus, canWopiOpen } from "@/hooks/use-wopi-status";
+import { useOwnDomainAddress } from "@/hooks/use-own-domain-address";
+import { emitThreadExpand } from "@/lib/plugin-thread-expand";
+import { PluginSlot } from "@/components/plugins/plugin-slot";
+import { ReaderSelectionMenu, useReaderSelectionMenu, watchBodySelection } from "./reader-selection-menu";
+import { PluginActions } from "@/components/plugins/plugin-actions";
+import { usePluginSlotOffers } from "@/hooks/use-plugin-slot-offers";
+import { useDeviceDetection } from "@/hooks/use-media-query";
+import { usePluginRenderedBody } from "@/hooks/use-plugin-rendered-body";
+import { emailToReadView } from "@/lib/plugin-projection";
+import { AttachmentPluginMenu, ReaderAboveQuoteSlot } from "./reader-plugin-surfaces";
+
+export type ConversationAttachmentHandler = (
+  blobId: string, name: string, type: string | undefined, source: EmailBlobContext,
+) => void;
 
 interface ThreadConversationViewProps {
   thread: ThreadGroup;
@@ -46,8 +66,12 @@ interface ThreadConversationViewProps {
   onReply?: (email: Email) => void;
   onReplyAll?: (email: Email) => void;
   onForward?: (email: Email) => void;
-  onDownloadAttachment?: (blobId: string, name: string, type?: string) => void;
+  onDownloadAttachment?: ConversationAttachmentHandler;
+  /** Routing captured when this conversation was opened. */
+  blobSource?: EmailBlobContext;
   onMarkAsRead?: (emailId: string, read: boolean) => void;
+  /** Role of the folder the conversation was opened from, for plugin actions limited to some folders. */
+  mailboxRole?: string | null;
 }
 
 // Helper function to get file icon based on mime type or extension
@@ -73,187 +97,59 @@ const getFileIcon = (name?: string, type?: string) => {
   return File;
 };
 
-export function ThreadConversationView({
-  thread,
-  emails,
-  isLoading = false,
-  onBack,
-  onReply,
-  onReplyAll,
-  onForward,
-  onDownloadAttachment,
-  onMarkAsRead,
-}: ThreadConversationViewProps) {
-  const t = useTranslations();
+/**
+ * Whether a conversation message may load remote content: the user's policy,
+ * a trusted sender, or a one-off "load" for that message.
+ */
+export function useConversationExternalContent() {
   const externalContentPolicy = useSettingsStore((state) => state.externalContentPolicy);
   const addTrustedSender = useSettingsStore((state) => state.addTrustedSender);
   const isSenderTrusted = useSettingsStore((state) => state.isSenderTrusted);
   const trustedSendersAddressBook = useSettingsStore((state) => state.trustedSendersAddressBook);
   const isTrustedAddressBookSender = useContactStore((state) => state.isTrustedAddressBookSender);
   const addToTrustedSendersBook = useContactStore((state) => state.addToTrustedSendersBook);
-  const { client } = useAuthStore();
+  const { client } = useAuthStore(useShallow((state) => ({ client: state.client })));
+  const [allowedIds, setAllowedIds] = useState<Set<string>>(new Set());
 
-  // Track which emails are expanded (most recent by default)
-  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
-  const [allowExternalContent, setAllowExternalContent] = useState<Set<string>>(new Set());
+  const allow = useCallback((emailId: string) => {
+    setAllowedIds(prev => new Set(prev).add(emailId));
+  }, []);
 
-  // Auto-expand most recent email AND all unread emails when thread opens
-  useEffect(() => {
-    if (emails.length > 0) {
-      const idsToExpand = new Set<string>();
+  const isAllowed = (email: Email) => {
+    const senderEmail = email.from?.[0]?.email?.toLowerCase();
+    const senderIsTrusted = senderEmail
+      ? isSenderTrusted(senderEmail) || (trustedSendersAddressBook && isTrustedAddressBookSender(senderEmail))
+      : false;
+    return externalContentPolicy === 'allow' || !!senderIsTrusted || allowedIds.has(email.id);
+  };
 
-      // Always expand most recent
-      idsToExpand.add(emails[0].id);
-
-      // Also expand all unread emails
-      emails.forEach(email => {
-        if (!email.keywords?.$seen) {
-          idsToExpand.add(email.id);
-        }
-      });
-
-      setExpandedIds(idsToExpand);
-    }
-  }, [emails]);
-
-  const toggleExpanded = (emailId: string) => {
-    setExpandedIds(prev => {
-      const next = new Set(prev);
-      if (next.has(emailId)) {
-        next.delete(emailId);
+  const trustSender = (email: Email) => {
+    const senderEmail = email.from?.[0]?.email?.toLowerCase();
+    if (!senderEmail) return undefined;
+    return () => {
+      if (trustedSendersAddressBook && client) {
+        addToTrustedSendersBook(client, senderEmail).catch(console.error);
       } else {
-        next.add(emailId);
+        addTrustedSender(senderEmail);
       }
-      return next;
-    });
+      allow(email.id);
+    };
   };
 
-  const toggleAllowExternal = (emailId: string) => {
-    setAllowExternalContent(prev => {
-      const next = new Set(prev);
-      next.add(emailId);
-      return next;
-    });
-  };
-
-  if (isLoading) {
-    return (
-      <div className="flex-1 flex items-center justify-center bg-background">
-        <div className="flex flex-col items-center gap-3">
-          <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
-          <p className="text-sm text-muted-foreground">{t("threads.loading")}</p>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex flex-col h-full bg-background">
-      {/* Header */}
-      <div className="flex items-center px-4 border-b border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 sticky top-0 z-10" style={{ gap: 'var(--density-item-gap)', paddingBlock: 'var(--density-header-py)' }}>
-        <button
-          onClick={onBack}
-          className="p-2 -ms-2 rounded-full hover:bg-muted transition-colors"
-        >
-          <ArrowLeft className="w-5 h-5" />
-        </button>
-        <div className="flex-1 min-w-0">
-          <h1 className="font-semibold text-foreground break-words">
-            {thread.latestEmail.subject || t("email_viewer.no_subject")}
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            {t("threads.messages_other", { count: emails.length })}
-          </p>
-        </div>
-      </div>
-
-      {/* Email Cards */}
-      <div className="flex-1 overflow-y-auto">
-        <div className="space-y-3" style={{ padding: 'var(--density-card-p)' }}>
-          {emails.map((email, index) => {
-            const senderEmail = email.from?.[0]?.email?.toLowerCase();
-            const senderIsTrusted = senderEmail
-              ? isSenderTrusted(senderEmail) || (trustedSendersAddressBook && isTrustedAddressBookSender(senderEmail))
-              : false;
-            return (
-              <EmailCard
-                key={email.id}
-                email={email}
-                isExpanded={expandedIds.has(email.id)}
-                isLatest={index === 0}
-                allowExternal={externalContentPolicy === 'allow' || senderIsTrusted || allowExternalContent.has(email.id)}
-                onToggleExpanded={() => toggleExpanded(email.id)}
-                onAllowExternal={() => toggleAllowExternal(email.id)}
-                onTrustSender={senderEmail ? () => {
-                  if (trustedSendersAddressBook && client) {
-                    addToTrustedSendersBook(client, senderEmail).catch(console.error);
-                  } else {
-                    addTrustedSender(senderEmail);
-                  }
-                  toggleAllowExternal(email.id);
-                } : undefined}
-                onReply={onReply ? () => onReply(email) : undefined}
-                onReplyAll={onReplyAll ? () => onReplyAll(email) : undefined}
-                onForward={onForward ? () => onForward(email) : undefined}
-                onDownloadAttachment={onDownloadAttachment}
-                onMarkAsRead={onMarkAsRead}
-              />
-            );
-          })}
-        </div>
-      </div>
-    </div>
-  );
+  return { isAllowed, allow, trustSender };
 }
 
-// Individual email card component
-interface EmailCardProps {
-  email: Email;
-  isExpanded: boolean;
-  isLatest: boolean;
-  allowExternal: boolean;
-  onToggleExpanded: () => void;
-  onAllowExternal: () => void;
-  onTrustSender?: () => void;
-  onReply?: () => void;
-  onReplyAll?: () => void;
-  onForward?: () => void;
-  onDownloadAttachment?: (blobId: string, name: string, type?: string) => void;
-  onMarkAsRead?: (emailId: string, read: boolean) => void;
-}
-
-function EmailCard({
-  email,
-  isExpanded,
-  isLatest: _isLatest,
-  allowExternal,
-  onToggleExpanded,
-  onAllowExternal,
-  onTrustSender,
-  onReply,
-  onReplyAll,
-  onForward,
-  onDownloadAttachment,
-  onMarkAsRead,
-}: EmailCardProps) {
-  const t = useTranslations();
-  const resolvedTheme = useThemeStore((state) => state.resolvedTheme);
-  const density = useSettingsStore((state) => state.density);
-  const mailAttachmentAction = useSettingsStore((state) => state.mailAttachmentAction);
-  const hideInlineImageAttachments = useSettingsStore((state) => state.hideInlineImageAttachments);
-  const emailAlwaysLightMode = useSettingsStore((state) => state.emailAlwaysLightMode);
-  const plainTextFont = useSettingsStore((state) => state.plainTextFont);
-  const sender = email.from?.[0];
-  const isUnread = !email.keywords?.$seen;
-  const isStarred = email.keywords?.$flagged;
-  const [hasBlockedContent, setHasBlockedContent] = useState(false);
-  const [cidBlobUrls, setCidBlobUrls] = useState<Record<string, string>>({});
-  const { client } = useAuthStore();
-
-  // Mark as read when email is expanded
+/**
+ * Starts the "mark as read" timer for an unread message while it is shown,
+ * following the user's mark-as-read delay.
+ */
+export function useMarkReadWhenShown(
+  email: Email,
+  shown: boolean,
+  onMarkAsRead?: (emailId: string, read: boolean) => void,
+) {
   useEffect(() => {
-    // Only trigger if expanded, email is unread, and we have a handler
-    if (!isExpanded || !onMarkAsRead || email.keywords?.$seen) {
+    if (!shown || !onMarkAsRead || email.keywords?.$seen) {
       return;
     }
 
@@ -276,18 +172,404 @@ function EmailCard({
     }, markAsReadDelay);
 
     return () => clearTimeout(timeout);
-  }, [isExpanded, email.id, email.keywords?.$seen, onMarkAsRead]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- a new handler identity must not restart the timer
+  }, [shown, email.id, email.keywords?.$seen]);
+}
+
+export function ThreadConversationView({
+  thread,
+  emails,
+  isLoading = false,
+  onBack,
+  onReply,
+  onReplyAll,
+  onForward,
+  onDownloadAttachment,
+  blobSource,
+  onMarkAsRead,
+  mailboxRole,
+}: ThreadConversationViewProps) {
+  const t = useTranslations();
+  const externalContent = useConversationExternalContent();
+  const emailIdList = emails.map((email) => email.id).join(',');
+  const { isMobile: summaryOnPhone, isTablet: summaryOnTablet } = useDeviceDetection();
+  const threadSummaryProps = useMemo(
+    () => ({ threadId: thread.latestEmail.threadId ?? null, emailIds: emailIdList ? emailIdList.split(',') : [], deviceType: summaryOnPhone ? 'mobile' : summaryOnTablet ? 'tablet' : 'desktop' }),
+    [thread.latestEmail.threadId, emailIdList, summaryOnPhone, summaryOnTablet],
+  );
+
+  // Track which emails are expanded (most recent by default)
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+
+  // Auto-expand most recent email AND all unread emails when thread opens
+  useEffect(() => {
+    if (emails.length > 0) {
+      const idsToExpand = new Set<string>();
+
+      // Always expand most recent
+      idsToExpand.add(emails[0].id);
+
+      // Also expand all unread emails
+      emails.forEach(email => {
+        if (!email.keywords?.$seen) {
+          idsToExpand.add(email.id);
+        }
+      });
+
+      setExpandedIds(idsToExpand);
+    }
+  }, [emails]);
+
+  const toggleExpanded = (emailId: string) => {
+    const target = emails.find((e) => e.id === emailId);
+    if (target) emitThreadExpand(target.threadId, [target], !expandedIds.has(emailId));
+    setExpandedIds(prev => {
+      const next = new Set(prev);
+      if (next.has(emailId)) {
+        next.delete(emailId);
+      } else {
+        next.add(emailId);
+      }
+      return next;
+    });
+  };
+
+  if (isLoading) {
+    return (
+      <div className="flex-1 flex items-center justify-center bg-background">
+        <div className="flex flex-col items-center gap-3">
+          <Loader2 className="w-8 h-8 animate-spin text-muted-foreground" />
+          <p className="text-sm text-muted-foreground">{t("threads.loading")}</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex flex-col h-full bg-background">
+      {/* Header */}
+      <div className="flex items-center px-4 border-b border-border bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 sticky top-0 z-10" style={{ gap: 'var(--density-item-gap)', paddingBlock: 'var(--density-header-py)' }}>
+        <button
+          onClick={onBack}
+          className="p-2 -ms-2 rounded-full hover:bg-muted transition-colors"
+          aria-label={t('email_viewer.back_to_list')}
+          title={t('email_viewer.back_to_list')}
+        >
+          <ArrowLeft className="w-5 h-5" />
+        </button>
+        <div className="flex-1 min-w-0">
+          <h1 className="font-semibold text-foreground break-words">
+            {thread.latestEmail.subject || t("email_viewer.no_subject")}
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            {t("threads.messages_other", { count: emails.length })}
+          </p>
+        </div>
+      </div>
+
+      {/* Email Cards */}
+      <div className="flex-1 overflow-y-auto">
+        <PluginSlot name="thread-summary" className="w-full" extraProps={threadSummaryProps} />
+        <div className="space-y-3" style={{ padding: 'var(--density-card-p)' }}>
+          {emails.map((email, index) => (
+            <EmailCard
+              key={email.id}
+              email={email}
+              isExpanded={expandedIds.has(email.id)}
+              isLatest={index === 0}
+              allowExternal={externalContent.isAllowed(email)}
+              onToggleExpanded={() => toggleExpanded(email.id)}
+              onAllowExternal={() => externalContent.allow(email.id)}
+              onTrustSender={externalContent.trustSender(email)}
+              onReply={onReply ? () => onReply(email) : undefined}
+              onReplyAll={onReplyAll ? () => onReplyAll(email) : undefined}
+              onForward={onForward ? () => onForward(email) : undefined}
+              onDownloadAttachment={onDownloadAttachment}
+            blobSource={blobSource}
+              onMarkAsRead={onMarkAsRead}
+              mailboxRole={mailboxRole}
+            />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Individual email card component
+interface EmailCardProps {
+  email: Email;
+  isExpanded: boolean;
+  isLatest: boolean;
+  allowExternal: boolean;
+  onToggleExpanded: () => void;
+  onAllowExternal: () => void;
+  onTrustSender?: () => void;
+  onReply?: () => void;
+  onReplyAll?: () => void;
+  onForward?: () => void;
+  onDownloadAttachment?: ConversationAttachmentHandler;
+  /** Routing captured when this conversation was opened. */
+  blobSource?: EmailBlobContext;
+  onMarkAsRead?: (emailId: string, read: boolean) => void;
+  mailboxRole?: string | null;
+}
+
+/**
+ * The single reader's plugin surfaces for one message of the phone
+ * conversation, mounted only while the message is unfolded: reader-header
+ * on top, reader-below-subject and email-banner under the sender,
+ * email-footer under the body. The props are the same as in the single
+ * reader and stay stable across re-renders.
+ */
+function useConversationPluginProps(email: Email) {
+  const headerOffers = usePluginSlotOffers('reader-header').length;
+  const belowSubjectOffers = usePluginSlotOffers('reader-below-subject').length;
+  const bannerOffers = usePluginSlotOffers('email-banner').length;
+  const wantsView = headerOffers + belowSubjectOffers + bannerOffers > 0;
+  const { isMobile, isTablet } = useDeviceDetection();
+  const deviceType = isMobile ? 'mobile' : isTablet ? 'tablet' : 'desktop';
+  const emailProps = useMemo(() => ({ email: wantsView ? emailToReadView(email) : null, deviceType }), [email, wantsView, deviceType]);
+  const idProps = useMemo(() => ({ emailId: email.id }), [email.id]);
+  return { emailProps, idProps };
+}
+
+function EmailCard({
+  email,
+  isExpanded,
+  isLatest: _isLatest,
+  allowExternal,
+  onToggleExpanded,
+  onAllowExternal,
+  onTrustSender,
+  onReply,
+  onReplyAll,
+  onForward,
+  onDownloadAttachment,
+  blobSource,
+  onMarkAsRead,
+  mailboxRole,
+}: EmailCardProps) {
+  const t = useTranslations();
+  const density = useSettingsStore((state) => state.density);
+  const plugin = useConversationPluginProps(email);
+  const sender = email.from?.[0];
+  const formatAddress = useOwnDomainAddress();
+  const isUnread = !email.keywords?.$seen;
+  const isStarred = email.keywords?.$flagged;
+
+  // Mark as read when email is expanded
+  useMarkReadWhenShown(email, isExpanded, onMarkAsRead);
+
+  return (
+    <div className={cn(
+      "rounded-lg border border-border overflow-hidden transition-all duration-200",
+      isExpanded ? "bg-background shadow-sm" : "bg-muted/30",
+      isUnread && !isExpanded && "border-s-2 border-l-primary"
+    )}>
+      {isExpanded && <PluginSlot name="reader-header" className="w-full" extraProps={plugin.emailProps} />}
+      {/* Card Header - Always visible */}
+      <button
+        onClick={onToggleExpanded}
+        className={cn(
+          "w-full flex items-start text-start transition-colors",
+          !isExpanded && "hover:bg-muted/50"
+        )}
+        style={{ gap: 'var(--density-item-gap)', padding: 'var(--density-card-p)' }}
+      >
+        {density !== 'extra-compact' && (
+          <Avatar
+            name={sender?.name}
+            email={sender?.email}
+            size="md"
+            className="flex-shrink-0"
+          />
+        )}
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 mb-0.5">
+            <span className={cn(
+              "font-medium truncate",
+              isUnread ? "text-foreground" : "text-muted-foreground"
+            )}>
+              {sender?.name || (sender?.email && formatAddress(sender.email)) || "Unknown"}
+            </span>
+            {isStarred && (
+              <Star className="w-4 h-4 fill-amber-400 text-amber-400 flex-shrink-0" />
+            )}
+            {email.hasAttachment && (
+              <Paperclip className="w-4 h-4 text-muted-foreground flex-shrink-0" />
+            )}
+          </div>
+          <div className="text-sm text-muted-foreground">
+            {formatDate(emailDisplayDate(email))}
+          </div>
+          {!isExpanded && density !== 'extra-compact' && (
+            <p className="text-sm text-muted-foreground mt-1 line-clamp-2">
+              {cleanPreview(email.preview) || t('email_viewer.no_preview_available')}
+            </p>
+          )}
+        </div>
+        <div className="flex-shrink-0 p-1">
+          {isExpanded ? (
+            <ChevronUp className="w-5 h-5 text-muted-foreground" />
+          ) : (
+            <ChevronDown className="w-5 h-5 text-muted-foreground" />
+          )}
+        </div>
+      </button>
+
+      {/* Expanded Content */}
+      {isExpanded && (
+        <div className="border-t border-border animate-in slide-in-from-top-2 duration-200">
+          <PluginSlot name="reader-below-subject" className="w-full" extraProps={plugin.emailProps} />
+          <PluginSlot name="email-banner" className="w-full" extraProps={plugin.emailProps} />
+          <ConversationEmailBody
+            email={email}
+            allowExternal={allowExternal}
+            onAllowExternal={onAllowExternal}
+            onTrustSender={onTrustSender}
+            onDownloadAttachment={onDownloadAttachment}
+            blobSource={blobSource}
+          />
+          <PluginSlot name="email-footer" className="w-full" extraProps={plugin.idProps} />
+
+          {/* Action Buttons; plugin reader actions behind a "more" button, as
+              in the single reader's More panel on phones. */}
+          <div className="px-4 pb-4 flex gap-2">
+            {onReply && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onReply();
+                }}
+                className="flex-1 min-w-0 px-2 whitespace-nowrap"
+              >
+                <Reply className="w-4 h-4 me-1.5 shrink-0" />
+                <span className="truncate">{t("email_viewer.reply")}</span>
+              </Button>
+            )}
+            {onReplyAll && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onReplyAll();
+                }}
+                className="flex-1 min-w-0 px-2 whitespace-nowrap"
+              >
+                <ReplyAll className="w-4 h-4 me-1.5 shrink-0" />
+                <span className="truncate">{t("email_viewer.reply_all")}</span>
+              </Button>
+            )}
+            {onForward && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onForward();
+                }}
+                className="flex-1 min-w-0 px-2 whitespace-nowrap"
+              >
+                <Forward className="w-4 h-4 me-1.5 shrink-0" />
+                <span className="truncate">{t("email_viewer.forward")}</span>
+              </Button>
+            )}
+            <PluginActions
+              surface="reader-actions"
+              context={plugin.idProps}
+              mailboxRole={mailboxRole ?? null}
+              overflow
+              className="flex-shrink-0 rounded-md border border-border"
+            />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface ConversationEmailBodyProps {
+  email: Email;
+  allowExternal: boolean;
+  onAllowExternal: () => void;
+  onTrustSender?: () => void;
+  onDownloadAttachment?: ConversationAttachmentHandler;
+  /** Routing captured when this conversation was opened. */
+  blobSource?: EmailBlobContext;
+  /** Padding around the body; the phone card's density padding by default. */
+  bodyStyle?: React.CSSProperties;
+  className?: string;
+}
+
+/**
+ * One conversation message's body: the remote-content banner, the sanitized
+ * body in a sandboxed iframe and its attachments. Shared by the phone thread
+ * view and Mountain View's expanded conversation messages.
+ */
+export function ConversationEmailBody({
+  email,
+  allowExternal,
+  onAllowExternal,
+  onTrustSender,
+  onDownloadAttachment,
+  blobSource,
+  bodyStyle,
+  className,
+}: ConversationEmailBodyProps) {
+  const t = useTranslations();
+  const resolvedTheme = useThemeStore((state) => state.resolvedTheme);
+  const mailAttachmentAction = useSettingsStore((state) => state.mailAttachmentAction);
+  const wopiStatus = useWopiStatus(true);
+  const hideInlineImageAttachments = useSettingsStore((state) => state.hideInlineImageAttachments);
+  const emailAlwaysLightMode = useSettingsStore((state) => state.emailAlwaysLightMode);
+  const isDark = resolvedTheme === 'dark' && !emailAlwaysLightMode;
+  const plainTextFont = useSettingsStore((state) => state.plainTextFont);
+  const showVerificationCodes = useSettingsStore((state) => state.showVerificationCodes);
+  const verificationCode = useMemo(
+    () => (showVerificationCodes ? findVerificationCode(email.subject, verificationCodeBodyText(email)) : null),
+    // A keyword change replaces the email object; only another body needs another look.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [showVerificationCodes, email.id, email.subject, email.bodyValues],
+  );
+  const [hasBlockedContent, setHasBlockedContent] = useState(false);
+  const { client } = useAuthStore(useShallow((state) => ({
+    client: state.client, revision: state.connectedAccountsRevision,
+  })));
+  const fallbackSource = useEmailStore(useShallow(() => resolveEmailBlobContext(email, client)));
+  const source = blobSource ?? fallbackSource;
+  const { client: blobClient, accountId } = source;
+  // Local CID URLs belong to a particular client/owner/message/part list.
+  // Hide the previous set during render, before the new fetch's effect runs.
+  const cidRequest = useMemo(() => ({ blobClient, accountId, emailId: email.id, attachments: email.attachments }),
+    [blobClient, accountId, email.id, email.attachments]);
+  const [cidResult, setCidResult] = useState<{ request: typeof cidRequest; urls: Record<string, string> } | null>(null);
+  const cidBlobUrls = useMemo(() => cidResult?.request === cidRequest ? cidResult.urls : {}, [cidResult, cidRequest]);
+  // A crypto plugin's decrypted body (PGP, S/MIME) replaces the message's own.
+  const pluginBody = usePluginRenderedBody(email);
+  // reader-above-quote: the body the quote was collapsed in, once it is on screen.
+  const [htmlBodyEl, setHtmlBodyEl] = useState<HTMLElement | null>(null);
+  const [plainBodyEl, setPlainBodyEl] = useState<HTMLDivElement | null>(null);
+  const selectionMenu = useReaderSelectionMenu();
+  const wantsQuoteSlot = usePluginSlotOffers('reader-above-quote').length > 0;
+  const quoteSlotProps = useMemo(
+    () => ({ email: wantsQuoteSlot ? emailToReadView(email) : null }),
+    [email, wantsQuoteSlot],
+  );
 
   // Fetch inline CID images with authentication to prevent browser auth dialogs
   useEffect(() => {
-    if (!client || !email?.attachments) {
-      setCidBlobUrls({});
+    if (!blobClient || !cidRequest.attachments) {
+      setCidResult(null);
       return;
     }
 
-    const cidAttachments = email.attachments.filter(att => att.cid && att.blobId);
+    const cidAttachments = cidRequest.attachments.filter(att => att.cid && att.blobId);
     if (cidAttachments.length === 0) {
-      setCidBlobUrls({});
+      setCidResult(null);
       return;
     }
 
@@ -297,11 +579,11 @@ function EmailCard({
     async function fetchCidBlobs() {
       const urls: Record<string, string> = {};
       await Promise.all(cidAttachments.map(async (att) => {
-        const cidValue = att.cid!.replace(/^<|>$/g, '');
+        const cidValue = normalizeCid(att.cid!);
         try {
           // Re-type sender-declared script-bearing parts before they become a
           // blob: URL in our origin (GHSA-xvjh-v9c6-qcvc).
-          const objectUrl = URL.createObjectURL(toInertBlob(await client!.fetchBlob(att.blobId, att.name || 'inline', att.type)));
+          const objectUrl = URL.createObjectURL(toInertBlob(await blobClient!.fetchBlob(att.blobId, att.name || 'inline', att.type, accountId)));
           if (!cancelled) {
             urls[cidValue] = objectUrl;
             objectUrls.push(objectUrl);
@@ -313,7 +595,7 @@ function EmailCard({
         }
       }));
       if (!cancelled) {
-        setCidBlobUrls(urls);
+        setCidResult({ request: cidRequest, urls });
       }
     }
 
@@ -323,11 +605,35 @@ function EmailCard({
       cancelled = true;
       objectUrls.forEach(url => URL.revokeObjectURL(url));
     };
-  }, [client, email?.id, email?.attachments]);
+  }, [cidRequest, blobClient, accountId]);
 
   // Sanitize and prepare email HTML content
   const emailContent = useMemo(() => {
     if (!email) return { html: "", isHtml: false };
+
+    // Plugin-rendered bodies get the reader's sanitizer and remote-content
+    // blocking, like any other mail body (#797).
+    if (pluginBody.html) {
+      const withCids = pluginBody.html.replace(
+        /\bcid:([^"'\s)]+)/gi,
+        (_match, cidRef) => pluginBody.cidUrls[cidRef] || cidBlobUrls[cidRef] || 'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7',
+      );
+      const { html, blockedExternalContent } = sanitizeEmailBodyForIframe(withCids, !allowExternal);
+      if (blockedExternalContent) {
+        if (!hasBlockedContent) setHasBlockedContent(true);
+        return { html: collapseBlockedImageContainers(html), isHtml: true };
+      }
+      return { html, isHtml: true };
+    }
+    if (pluginBody.text) {
+      return {
+        html: collapsePlainTextQuotes(plainTextToSafeHtml(pluginBody.text, 'text-primary hover:underline'), {
+          show: t('email_viewer.show_quoted_text'),
+          hide: t('email_viewer.hide_quoted_text'),
+        }),
+        isHtml: false,
+      };
+    }
 
     if (email.bodyValues) {
       let htmlContent = getRenderableHtmlBody(email);
@@ -350,55 +656,20 @@ function EmailCard({
         const sanitizeConfig = { ...EMAIL_SANITIZE_CONFIG };
 
         DOMPurify.addHook('afterSanitizeAttributes', (node) => {
-          const htmlNode = node as HTMLElement;
-
           // Re-apply the data:-URI allowlist DOMPurify skips on media tags.
           restrictDataUriResourcesOnNode(node);
 
-          if (!allowExternal) {
-            if (node.tagName === 'IMG') {
-              const src = node.getAttribute('src');
-              if (src && (src.startsWith('http://') || src.startsWith('https://') || src.startsWith('//'))) {
-                node.setAttribute('data-blocked-src', src);
-                node.removeAttribute('src');
-                node.setAttribute('alt', '[Image blocked]');
-                blockedExternalContent = true;
-              }
-            }
-            if (node.hasAttribute('style')) {
-              const style = node.getAttribute('style');
-              if (style && /url\s*\(/i.test(style)) {
-                const cleanStyle = style.replace(/url\s*\([^)]*\)/gi, 'none');
-                node.setAttribute('style', cleanStyle);
-                blockedExternalContent = true;
-              }
-            }
+          // The desktop viewer's blocker: srcset, <source>, poster,
+          // background attributes and escaped url()s as well as img src.
+          if (!allowExternal && blockExternalResourcesOnNode(node)) {
+            blockedExternalContent = true;
           }
 
-          if (node.tagName === 'A') {
+          if (node.tagName === 'A' || node.tagName === 'AREA') {
             node.setAttribute('target', '_blank');
             node.setAttribute('rel', 'noopener noreferrer');
           }
 
-          if (resolvedTheme === 'dark' && !emailAlwaysLightMode) {
-            if (htmlNode.style) {
-              const originalStyles = htmlNode.style.cssText;
-              const transformedStyles = transformInlineStyles(originalStyles, 'dark');
-              if (transformedStyles !== originalStyles) {
-                htmlNode.style.cssText = transformedStyles;
-              }
-            }
-
-            const colorAttr = node.getAttribute('color');
-            if (colorAttr) {
-              node.setAttribute('color', transformColorForDarkMode(colorAttr));
-            }
-
-            const bgcolorAttr = node.getAttribute('bgcolor');
-            if (bgcolorAttr) {
-              node.setAttribute('bgcolor', transformBgColorForDarkMode(bgcolorAttr));
-            }
-          }
         });
 
         const sanitized = DOMPurify.sanitize(htmlContent, sanitizeConfig);
@@ -406,7 +677,7 @@ function EmailCard({
 
         let finalHtml = sanitized;
         if (blockedExternalContent) {
-          setHasBlockedContent(true);
+          if (!hasBlockedContent) setHasBlockedContent(true);
           finalHtml = collapseBlockedImageContainers(sanitized);
         }
 
@@ -437,7 +708,10 @@ function EmailCard({
     }
 
     return { html: "", isHtml: false };
-  }, [email, allowExternal, resolvedTheme, emailAlwaysLightMode, cidBlobUrls, t]);
+  // `hasBlockedContent` is only read to skip a redundant setState; as a
+  // dependency it would re-run the sanitizer once the banner shows.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [email, allowExternal, cidBlobUrls, pluginBody, t]);
 
   // Parts the body embeds via cid: stay out of the attachment row while the
   // user hides inline images - the desktop viewer's rule, shared through
@@ -456,11 +730,15 @@ function EmailCard({
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const emailIframeSrcDoc = useMemo(() => {
     if (!emailContent.isHtml || !emailContent.html) return '';
-    const csp = "default-src 'none'; img-src data: blob: http: https:; style-src 'unsafe-inline'; font-src data: http: https:; media-src data: blob: http: https:; base-uri 'none'; form-action 'none'; frame-src 'none'";
-    return `<!DOCTYPE html><html><head>
+    // Strict while external content is blocked: the network-level backstop
+    // for whatever the DOM walk above cannot see.
+    const csp = emailIframeCsp(!allowExternal);
+    // Colours are rewritten after load (applyEmailDarkMode in handleIframeLoad).
+    return `<!DOCTYPE html><html class="${isDark ? DARK_PENDING_CLASS : ''}"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="Content-Security-Policy" content="${csp}">
+<meta name="referrer" content="no-referrer">
 <style>
   /* overflow-y hidden keeps the scrollHeight measurement below honest. overflow-x
      is auto so intrinsically wide content can pan instead of being clipped outright;
@@ -486,8 +764,16 @@ function EmailCard({
   table { table-layout: auto; overflow-wrap: break-word; }
   td, th { word-break: break-word; padding: 0.5rem; }
   pre { white-space: pre-wrap; word-wrap: break-word; }
+  ${isDark ? emailDarkModeCss() : ''}
 </style></head><body dir="auto">${emailContent.html}</body></html>`;
-  }, [emailContent.isHtml, emailContent.html]);
+  }, [emailContent.isHtml, emailContent.html, allowExternal, isDark]);
+  useLayoutEffect(() => { setHtmlBodyEl(null); }, [emailIframeSrcDoc]);
+  // One object per body: React writes innerHTML again whenever this object
+  // changes, dropping whatever was mounted in the body.
+  const plainBodyHtml = useMemo(
+    () => ({ __html: sanitizePlainTextRenderedHtml(emailContent.html) }),
+    [emailContent.html],
+  );
 
   const handleIframeLoad = useCallback(() => {
     const iframe = iframeRef.current;
@@ -501,6 +787,7 @@ function EmailCard({
         show: t('email_viewer.show_quoted_text'),
         hide: t('email_viewer.hide_quoted_text'),
       });
+      if (isDark) applyEmailDarkMode(doc, { remoteContentAllowed: allowExternal });
       const resize = () => {
         // Fit desktop-width mail to the screen before measuring: the transform
         // leaves the layout height untouched, so scale the box by hand.
@@ -511,215 +798,137 @@ function EmailCard({
       resize();
       const ro = new ResizeObserver(resize);
       ro.observe(doc.body);
-      doc.querySelectorAll('a').forEach((a) => {
+      doc.querySelectorAll('a, area').forEach((a) => {
         a.setAttribute('target', '_blank');
         a.setAttribute('rel', 'noopener noreferrer');
       });
+      // Selected text: the onTextSelectionChange hook and the right-click
+      // menu plugins may add entries to.
+      watchBodySelection(doc, iframe, {
+        emailId: email.id,
+        onContextMenu: (point, text) => selectionMenu.openRef.current(point, { emailId: email.id, text }),
+      });
+      setHtmlBodyEl(doc.body);
     } catch {
       // contentDocument may be inaccessible under stricter sandboxes; ignore.
     }
-  }, [t]);
+  }, [t, isDark, allowExternal, email.id, selectionMenu.openRef]);
 
   return (
-    <div className={cn(
-      "rounded-lg border border-border overflow-hidden transition-all duration-200",
-      isExpanded ? "bg-background shadow-sm" : "bg-muted/30",
-      isUnread && !isExpanded && "border-s-2 border-l-primary"
-    )}>
-      {/* Card Header - Always visible */}
-      <button
-        onClick={onToggleExpanded}
-        className={cn(
-          "w-full flex items-start text-start transition-colors",
-          !isExpanded && "hover:bg-muted/50"
-        )}
-        style={{ gap: 'var(--density-item-gap)', padding: 'var(--density-card-p)' }}
-      >
-        {density !== 'extra-compact' && (
-          <Avatar
-            name={sender?.name}
-            email={sender?.email}
-            size="md"
-            className="flex-shrink-0"
+    <div className={className}>
+      {/* External content warning */}
+      {hasBlockedContent && !allowExternal && (
+        <div className="px-4 py-2 bg-muted/50 flex items-center justify-between text-sm">
+          <span className="text-muted-foreground">
+            {t("email_viewer.external_content_warning")}
+          </span>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={(e) => {
+                e.stopPropagation();
+                onAllowExternal();
+              }}
+            >
+              {t("email_viewer.load_external_content")}
+            </Button>
+            {onTrustSender && (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onTrustSender();
+                }}
+              >
+                {t("email_viewer.trust_sender")}
+              </Button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {verificationCode && (
+        <div className="flex" style={{ paddingInline: 'var(--density-card-p)', paddingTop: 'var(--density-card-p)' }}>
+          <VerificationCodeChip code={verificationCode} className="py-1 text-sm" />
+        </div>
+      )}
+
+      {/* Email Body */}
+      <div className="relative" style={bodyStyle ?? { padding: 'var(--density-card-p)' }}>
+        {emailContent.isHtml ? (
+          <iframe
+            ref={iframeRef}
+            srcDoc={emailIframeSrcDoc}
+            sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
+            title="Email content"
+            className="w-full border-0 block"
+            scrolling="no"
+            style={{ minHeight: '60px' }}
+            onLoad={handleIframeLoad}
+          />
+        ) : (
+          <div
+            ref={setPlainBodyEl}
+            className={cn(
+              "prose prose-sm max-w-none",
+              !emailAlwaysLightMode && "dark:prose-invert",
+              "prose-p:my-2 prose-headings:my-3",
+              "prose-a:text-primary prose-a:no-underline hover:prose-a:underline",
+              "[&_table]:border-collapse [&_td]:p-2 [&_th]:p-2",
+              "[&_img]:max-w-full [&_img]:h-auto"
+            )}
+            style={{ whiteSpace: 'pre-wrap', ...(plainTextFont === 'mono' && { fontFamily: 'ui-monospace, "SF Mono", Consolas, monospace' }), fontSize: '13px' }}
+            data-plugin-source="email-body"
+            data-email-id={email.id}
+            onContextMenu={(e) => selectionMenu.onElementContextMenu(e, email.id)}
+            dangerouslySetInnerHTML={plainBodyHtml}
           />
         )}
-        <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 mb-0.5">
-            <span className={cn(
-              "font-medium truncate",
-              isUnread ? "text-foreground" : "text-muted-foreground"
-            )}>
-              {sender?.name || sender?.email || "Unknown"}
-            </span>
-            {isStarred && (
-              <Star className="w-4 h-4 fill-amber-400 text-amber-400 flex-shrink-0" />
-            )}
-            {email.hasAttachment && (
-              <Paperclip className="w-4 h-4 text-muted-foreground flex-shrink-0" />
-            )}
-          </div>
-          <div className="text-sm text-muted-foreground">
-            {formatDate(email.receivedAt)}
-          </div>
-          {!isExpanded && density !== 'extra-compact' && (
-            <p className="text-sm text-muted-foreground mt-1 line-clamp-2">
-              {email.preview || t('email_viewer.no_preview_available')}
-            </p>
-          )}
-        </div>
-        <div className="flex-shrink-0 p-1">
-          {isExpanded ? (
-            <ChevronUp className="w-5 h-5 text-muted-foreground" />
-          ) : (
-            <ChevronDown className="w-5 h-5 text-muted-foreground" />
-          )}
-        </div>
-      </button>
+        <ReaderSelectionMenu menu={selectionMenu} />
+        <ReaderAboveQuoteSlot
+          root={emailContent.isHtml ? htmlBodyEl : plainBodyEl}
+          frame={emailContent.isHtml ? iframeRef.current : null}
+          extraProps={quoteSlotProps}
+          version={emailContent.html}
+        />
+      </div>
 
-      {/* Expanded Content */}
-      {isExpanded && (
-        <div className="border-t border-border animate-in slide-in-from-top-2 duration-200">
-          {/* External content warning */}
-          {hasBlockedContent && !allowExternal && (
-            <div className="px-4 py-2 bg-muted/50 flex items-center justify-between text-sm">
-              <span className="text-muted-foreground">
-                {t("email_viewer.external_content_warning")}
-              </span>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="ghost"
-                  size="sm"
+      {/* Attachments */}
+      {visibleAttachments.length > 0 && (
+        <div className="px-4 pb-4">
+          <div className="flex flex-wrap gap-2">
+            {visibleAttachments.map((attachment, idx) => {
+              const Icon = getFileIcon(attachment.name, attachment.type);
+              const isPreviewable = isFilePreviewable(attachment.name, attachment.type)
+                || (!!attachment.blobId && canWopiOpen(wopiStatus, attachment.name));
+              const opensPreview = isPreviewable && mailAttachmentAction === 'preview';
+              return (
+                <React.Fragment key={idx}>
+                <button
                   onClick={(e) => {
                     e.stopPropagation();
-                    onAllowExternal();
+                    onDownloadAttachment?.(attachment.blobId, attachment.name || 'attachment', attachment.type, source);
                   }}
+                  title={opensPreview ? t('files.preview') : t('email_viewer.download')}
+                  className="flex items-center gap-2 px-3 py-2 rounded-lg bg-muted hover:bg-muted/80 transition-colors text-sm"
                 >
-                  {t("email_viewer.load_external_content")}
-                </Button>
-                {onTrustSender && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      onTrustSender();
-                    }}
-                  >
-                    {t("email_viewer.trust_sender")}
-                  </Button>
-                )}
-              </div>
-            </div>
-          )}
-
-          {/* Email Body */}
-          <div style={{ padding: 'var(--density-card-p)' }}>
-            {emailContent.isHtml ? (
-              <iframe
-                ref={iframeRef}
-                srcDoc={emailIframeSrcDoc}
-                sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"
-                title="Email content"
-                className="w-full border-0 block"
-                scrolling="no"
-                style={{ minHeight: '60px' }}
-                onLoad={handleIframeLoad}
-              />
-            ) : (
-              <div
-                className={cn(
-                  "prose prose-sm max-w-none",
-                  !emailAlwaysLightMode && "dark:prose-invert",
-                  "prose-p:my-2 prose-headings:my-3",
-                  "prose-a:text-primary prose-a:no-underline hover:prose-a:underline",
-                  "[&_table]:border-collapse [&_td]:p-2 [&_th]:p-2",
-                  "[&_img]:max-w-full [&_img]:h-auto"
-                )}
-                style={{ whiteSpace: 'pre-wrap', ...(plainTextFont === 'mono' && { fontFamily: 'ui-monospace, "SF Mono", Consolas, monospace' }), fontSize: '13px' }}
-                dangerouslySetInnerHTML={{ __html: sanitizePlainTextRenderedHtml(emailContent.html) }}
-              />
-            )}
-          </div>
-
-          {/* Attachments */}
-          {visibleAttachments.length > 0 && (
-            <div className="px-4 pb-4">
-              <div className="flex flex-wrap gap-2">
-                {visibleAttachments.map((attachment, idx) => {
-                  const Icon = getFileIcon(attachment.name, attachment.type);
-                  const isPreviewable = isFilePreviewable(attachment.name, attachment.type);
-                  const opensPreview = isPreviewable && mailAttachmentAction === 'preview';
-                  return (
-                    <button
-                      key={idx}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onDownloadAttachment?.(attachment.blobId, attachment.name || 'attachment', attachment.type);
-                      }}
-                      title={opensPreview ? t('files.preview') : t('email_viewer.download')}
-                      className="flex items-center gap-2 px-3 py-2 rounded-lg bg-muted hover:bg-muted/80 transition-colors text-sm"
-                    >
-                      <Icon className="w-4 h-4 text-muted-foreground" />
-                      <span className="truncate max-w-[150px]">{attachment.name || 'Attachment'}</span>
-                      <span className="text-muted-foreground text-xs">
-                        {formatFileSize(attachment.size)}
-                      </span>
-                      {opensPreview ? (
-                        <Eye className="w-4 h-4 text-muted-foreground" />
-                      ) : (
-                        <Download className="w-4 h-4 text-muted-foreground" />
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {/* Action Buttons */}
-          <div className="px-4 pb-4 flex gap-2">
-            {onReply && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onReply();
-                }}
-                className="flex-1"
-              >
-                <Reply className="w-4 h-4 me-2" />
-                {t("email_viewer.reply")}
-              </Button>
-            )}
-            {onReplyAll && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onReplyAll();
-                }}
-                className="flex-1"
-              >
-                <ReplyAll className="w-4 h-4 me-2" />
-                {t("email_viewer.reply_all")}
-              </Button>
-            )}
-            {onForward && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onForward();
-                }}
-                className="flex-1"
-              >
-                <Forward className="w-4 h-4 me-2" />
-                {t("email_viewer.forward")}
-              </Button>
-            )}
+                  <Icon className="w-4 h-4 text-muted-foreground" />
+                  <span className="truncate max-w-[150px]">{attachment.name || 'Attachment'}</span>
+                  <span className="text-muted-foreground text-xs">
+                    {formatFileSize(attachment.size)}
+                  </span>
+                  {opensPreview ? (
+                    <Eye className="w-4 h-4 text-muted-foreground" />
+                  ) : (
+                    <Download className="w-4 h-4 text-muted-foreground" />
+                  )}
+                </button>
+                <AttachmentPluginMenu emailId={email.id} attachment={attachment} className="-ms-1.5 self-center p-2 rounded-lg" />
+                </React.Fragment>
+              );
+            })}
           </div>
         </div>
       )}

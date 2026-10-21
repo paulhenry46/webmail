@@ -1,12 +1,34 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
+import { generateUUID } from "@/lib/utils";
 import { useTranslations } from "next-intl";
 import { X, Download, Loader2, ExternalLink } from "@/components/icons";
 import { Button } from "@/components/ui/button";
-import { getFilePreviewKind, isMimeTypeSafeForInlinePreview } from "@/lib/file-preview";
+import { ZoomableImage } from "@/components/files/zoomable-image";
+import { getFilePreviewKind, imageBlobUrl, isMimeTypeSafeForInlinePreview, previewBlobType } from "@/lib/file-preview";
 import dynamic from "next/dynamic";
 import { EmlPreview, type ParsedEml } from "@/components/files/eml-preview";
+import { FilePreviewPluginSection } from "@/components/files/file-preview-plugin-section";
+import { canOpenUrlInNewWindow } from "@/lib/standalone-display";
+import { emailIframeCsp, sanitizeEmailBodyForIframe } from "@/lib/email-sanitization";
+import { useSettingsStore } from "@/stores/settings-store";
+import type { FileResourceView } from "@/lib/plugin-types";
+
+/**
+ * An HTML attachment as a document for a fully locked frame (sandbox="",
+ * srcdoc): the sender's markup sanitised like a mail body, remote content
+ * blocked under the same setting, and a CSP as the network backstop. It used
+ * to be shown from a text/html blob: URL, which is a document of the webmail
+ * origin: a link inside the sandboxed frame resolved to that URL, and dragging
+ * or copying it into a new tab ran the sender's script as the webmail
+ * (the mechanism of GHSA-xvjh-v9c6-qcvc), while nothing sanitised it or
+ * stopped its remote images and meta refreshes.
+ */
+export function htmlAttachmentDocument(html: string, blockRemote: boolean): string {
+  const body = sanitizeEmailBodyForIframe(html, blockRemote).html;
+  return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${emailIframeCsp(blockRemote)}"><meta name="referrer" content="no-referrer"></head><body>${body}</body></html>`;
+}
 
 // pdf.js-based inline viewer for mobile (no native inline PDF viewer). Loaded
 // only on the mobile PDF path so pdfjs-dist + its worker never reach the
@@ -16,39 +38,13 @@ const PdfMobileViewer = dynamic(
   { ssr: false },
 );
 
-// Map a few well-known extensions back to canonical MIME types. Used when the
-// server returns application/octet-stream (or empty) for an attachment whose
-// actual type is obvious from the filename. The blob.type drives how browsers
-// render blob: URLs, so guessing wrong here means the inline preview silently
-// downgrades to a download.
-const EXT_TO_MIME: Record<string, string> = {
-  pdf: "application/pdf",
-  png: "image/png",
-  jpg: "image/jpeg",
-  jpeg: "image/jpeg",
-  gif: "image/gif",
-  webp: "image/webp",
-  avif: "image/avif",
-  bmp: "image/bmp",
-  mp3: "audio/mpeg",
-  wav: "audio/wav",
-  ogg: "audio/ogg",
-  m4a: "audio/mp4",
-  mp4: "video/mp4",
-  webm: "video/webm",
-  ogv: "video/ogg",
-};
-
-function inferMimeFromName(name: string): string | undefined {
-  const ext = name.toLowerCase().split(".").pop();
-  return ext ? EXT_TO_MIME[ext] : undefined;
-}
-
 interface FilePreviewModalProps {
   name: string;
   onClose: () => void;
   onDownload: () => Promise<void> | void;
   getFileContent: () => Promise<{ blob: Blob; contentType: string }>;
+  /** The previewed file as plugins see it (file-preview-section). */
+  file?: FileResourceView | null;
 }
 
 function SimpleMarkdown({ content }: { content: string }) {
@@ -142,7 +138,11 @@ function processInline(text: string): React.ReactNode {
   return parts.length === 1 ? parts[0] : <>{parts}</>;
 }
 
-export function FilePreviewModal({ name, onClose, onDownload, getFileContent }: FilePreviewModalProps) {
+// Closing one preview can leave an asynchronous Back traversal in flight.
+// A replacement must not install its popstate listener until that completes.
+let pendingPreviewHistoryBack: Promise<void> | null = null;
+
+export function FilePreviewModal({ name, onClose, onDownload, getFileContent, file }: FilePreviewModalProps) {
   const t = useTranslations("files");
   const [content, setContent] = useState<string | null>(null);
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
@@ -160,6 +160,8 @@ export function FilePreviewModal({ name, onClose, onDownload, getFileContent }: 
   // connect-src (#871). The URL is still what the <iframe> and the
   // open-in-new-tab fallback use.
   const [pdfBlob, setPdfBlob] = useState<Blob | null>(null);
+  const [htmlDoc, setHtmlDoc] = useState<string | null>(null);
+  const blockRemote = useSettingsStore((state) => state.externalContentPolicy) !== "allow";
 
   // Decide whether to render the PDF in a plain <iframe> (desktop) or with the
   // pdf.js canvas viewer (mobile). navigator.pdfViewerEnabled is the standard
@@ -184,22 +186,37 @@ export function FilePreviewModal({ name, onClose, onDownload, getFileContent }: 
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
-  // Make the Android/browser Back button close the preview instead of
-  // navigating the page underneath: push a throwaway history entry when the
-  // modal opens and close it on popstate. On a normal close (X / backdrop /
-  // Escape) the modal unmounts and we pop that entry ourselves, so the user's
-  // next Back isn't swallowed by it.
+  // Defer history setup so Strict Mode's setup/cleanup/setup replay can
+  // cancel the first setup without scheduling a browser Back traversal.
   useEffect(() => {
-    window.history.pushState({ __filePreview: true }, "");
+    const entryId = generateUUID();
+    let cancelled = false;
+    let started = false;
     let poppedByBack = false;
     const onPop = () => {
       poppedByBack = true;
       onCloseRef.current();
     };
-    window.addEventListener("popstate", onPop);
+    const timer = window.setTimeout(async () => {
+      if (pendingPreviewHistoryBack) await pendingPreviewHistoryBack;
+      if (cancelled) return;
+      window.history.pushState({ ...window.history.state, __filePreview: entryId }, "");
+      started = true;
+      window.addEventListener("popstate", onPop);
+    }, 0);
     return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
       window.removeEventListener("popstate", onPop);
-      if (!poppedByBack) window.history.back();
+      if (started && !poppedByBack && window.history.state?.__filePreview === entryId) {
+        pendingPreviewHistoryBack = new Promise<void>(resolve => {
+          window.addEventListener("popstate", () => {
+            pendingPreviewHistoryBack = null;
+            resolve();
+          }, { once: true });
+        });
+        window.history.back();
+      }
     };
   }, []);
 
@@ -214,6 +231,7 @@ export function FilePreviewModal({ name, onClose, onDownload, getFileContent }: 
     setCanOpenInNewTab(false);
     setEmlContent(null);
     setPdfBlob(null);
+    setHtmlDoc(null);
     setLoading(true);
     setError(false);
     setResolvedFileType(getFilePreviewKind(name));
@@ -230,6 +248,11 @@ export function FilePreviewModal({ name, onClose, onDownload, getFileContent }: 
         if (previewType === "text" || previewType === "markdown") {
           const text = await blob.text();
           if (!cancelled) setContent(text);
+        } else if (previewType === "html") {
+          // Sanitised text in a srcdoc frame, like the .eml preview; never a
+          // blob: URL of the sender's bytes (see htmlAttachmentDocument).
+          const text = await blob.text();
+          if (!cancelled) setHtmlDoc(htmlAttachmentDocument(text, blockRemote));
         } else if (previewType === "eml") {
           // Parse the embedded message (postal-mime, dynamic-imported so it
           // stays off the bundle) and render it like an email via EmlPreview.
@@ -237,30 +260,26 @@ export function FilePreviewModal({ name, onClose, onDownload, getFileContent }: 
           const parsed = await new PostalMime().parse(await blob.arrayBuffer());
           if (!cancelled) setEmlContent(parsed as ParsedEml);
         } else {
-          // Stalwart's download endpoint can return generic
-          // application/octet-stream for attachments even when the email's
-          // MIME structure declared application/pdf (etc.). The blob inherits
-          // that, so a blob: URL plugged into <iframe> looks like a binary
-          // stream and Chrome/Edge silently download it (with the blob UUID
-          // as filename) instead of rendering inline. Re-wrap with the most
-          // specific MIME we can resolve - prefer explicit attachment type,
-          // then filename-derived MIME, then whatever the blob came with.
-          const inferredFromName = inferMimeFromName(name);
-          const isUseless = (ty?: string) =>
-            !ty || ty === "application/octet-stream" || ty === "binary/octet-stream";
-          const effectiveType =
-            (contentType && !isUseless(contentType) ? contentType : undefined)
-            ?? inferredFromName
-            ?? blob.type;
+          // Re-type the blob to one its viewer can show; a blob: URL with a
+          // type the browser cannot display is silently downloaded instead.
+          const effectiveType = previewBlobType(name, contentType, blob.type);
           const typedBlob = blob.type !== effectiveType
             ? new Blob([blob], { type: effectiveType })
             : blob;
-          revokeUrl = URL.createObjectURL(typedBlob);
-          if (!cancelled) {
-            setObjectUrl(revokeUrl);
-            setCanOpenInNewTab(isMimeTypeSafeForInlinePreview(effectiveType));
-            if (previewType === "pdf") setPdfBlob(typedBlob);
+          // "Open image in new tab" loads the <img> URL as a document of its
+          // own, so an image gets one that stays inert there: a sender's SVG
+          // must not run script as the webmail origin (GHSA-xvjh-v9c6-qcvc).
+          const url = previewType === "image"
+            ? await imageBlobUrl(typedBlob)
+            : URL.createObjectURL(typedBlob);
+          if (cancelled) {
+            URL.revokeObjectURL(url);
+            return;
           }
+          revokeUrl = url;
+          setObjectUrl(url);
+          setCanOpenInNewTab(isMimeTypeSafeForInlinePreview(effectiveType));
+          if (previewType === "pdf") setPdfBlob(typedBlob);
         }
       } catch {
         if (!cancelled) setError(true);
@@ -277,7 +296,7 @@ export function FilePreviewModal({ name, onClose, onDownload, getFileContent }: 
         URL.revokeObjectURL(revokeUrl);
       }
     };
-  }, [getFileContent, name]);
+  }, [getFileContent, name, blockRemote]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -301,7 +320,9 @@ export function FilePreviewModal({ name, onClose, onDownload, getFileContent }: 
       <div className="flex items-center justify-between gap-2 pl-[calc(1rem+env(safe-area-inset-left))] pr-[calc(1rem+env(safe-area-inset-right))] pt-[calc(0.75rem+env(safe-area-inset-top))] pb-3 bg-background/90 backdrop-blur border-b border-border" onClick={(e) => e.stopPropagation()}>
         <h3 className="text-sm font-medium truncate">{name}</h3>
         <div className="flex items-center gap-2">
-          {objectUrl && canOpenInNewTab && (
+          {/* An installed app hands the new window to the system browser,
+              which cannot load our blob: URL (#865): no dead button there. */}
+          {objectUrl && canOpenInNewTab && canOpenUrlInNewWindow(objectUrl) && (
             <Button
               variant="ghost"
               size="icon"
@@ -322,7 +343,7 @@ export function FilePreviewModal({ name, onClose, onDownload, getFileContent }: 
         </div>
       </div>
 
-      <div className="flex-1 flex items-center justify-center overflow-auto p-4 pb-[calc(1rem+env(safe-area-inset-bottom))] pl-[calc(1rem+env(safe-area-inset-left))] pr-[calc(1rem+env(safe-area-inset-right))]">
+      <div className="relative flex-1 min-h-0 flex items-center justify-center overflow-auto p-4 pb-[calc(1rem+env(safe-area-inset-bottom))] pl-[calc(1rem+env(safe-area-inset-left))] pr-[calc(1rem+env(safe-area-inset-right))]">
         {loading && (
           <div className="flex flex-col items-center gap-2 text-muted-foreground">
             <Loader2 className="w-8 h-8 animate-spin" />
@@ -356,18 +377,14 @@ export function FilePreviewModal({ name, onClose, onDownload, getFileContent }: 
         )}
 
         {!loading && !error && fileType === "image" && objectUrl && (
-          <img
-            src={objectUrl}
-            alt={name}
-            className="max-w-full max-h-full object-contain rounded-lg bg-background"
-            draggable={false}
-            onClick={(e) => e.stopPropagation()}
-          />
+          <div className="absolute inset-0">
+            <ZoomableImage src={objectUrl} alt={name} onBackgroundClick={onClose} />
+          </div>
         )}
 
-        {!loading && !error && fileType === "html" && objectUrl && (
+        {!loading && !error && fileType === "html" && htmlDoc && (
           <iframe
-            src={objectUrl}
+            srcDoc={htmlDoc}
             sandbox=""
             className="w-full max-w-5xl h-full rounded-lg bg-white"
             title={name}
@@ -416,6 +433,7 @@ export function FilePreviewModal({ name, onClose, onDownload, getFileContent }: 
           />
         )}
       </div>
+      <FilePreviewPluginSection file={file} />
     </div>
   );
 }

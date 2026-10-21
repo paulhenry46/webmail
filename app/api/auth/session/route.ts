@@ -1,10 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { cookies } from 'next/headers';
 import { logger } from '@/lib/logger';
-import { encryptSession, decryptSession } from '@/lib/auth/crypto';
+import { encryptSession, decryptSession, sessionAuthHeader, type SessionCredentials } from '@/lib/auth/crypto';
 import { SESSION_COOKIE_MAX_AGE, sessionCookieName } from '@/lib/auth/session-cookie';
 import { getCookieOptions } from '@/lib/oauth/cookie-config';
-import { JmapAuthVerificationError, verifyJmapIdentity } from '@/lib/auth/verify-jmap-auth';
+import { JmapAuthVerificationError, resolveJmapIdentity } from '@/lib/auth/verify-jmap-auth';
 import {
   clearStalwartAuthContextInStore,
   setStalwartAuthContextInStore,
@@ -15,12 +15,54 @@ import { recordLogin } from '@/lib/telemetry/login-tracker';
 import { parseJmapServers, resolveTrustedJmapUrl } from '@/lib/admin/jmap-servers';
 import { MAX_ACCOUNT_SLOTS } from '@/lib/account-utils';
 import { rejectCrossOriginRequest } from '@/lib/security/same-origin';
+import { insecureCookieHint, verificationFailureBody } from '@/lib/auth/verification-failure';
+import { readImpersonationConfig } from '@/lib/impersonation/master-config';
+import { revokeImpersonationCredential } from '@/lib/impersonation/app-password';
+import { IMPERSONATION_GRANT_COOKIE, openImpersonationGrant } from '@/lib/impersonation/grant-cookie';
+import { revokeWopiTokens } from '@/lib/wopi/revocation';
+import { clearPairReauthInStore } from '@/lib/auth/pair-reauth';
+import { loginClientAddress } from '@/lib/auth/client-address';
+import { LOGIN_BUDGET_RETRY_AFTER_SECONDS, reserveLoginAttempt } from '@/lib/auth/verify-budget';
 
 function sessionCookieOptions() {
   return {
     ...getCookieOptions(),
     maxAge: SESSION_COOKIE_MAX_AGE,
   };
+}
+
+/**
+ * A session sealed around the impersonation master password. Handoffs made
+ * before impersonation switched to per-mailbox app passwords stored it in
+ * the session cookie; it opens every mailbox, so it is never handed back to
+ * a browser, whichever path stored it.
+ */
+function holdsMasterPassword(credentials: SessionCredentials): boolean {
+  const config = readImpersonationConfig();
+  return !!config && credentials.password === config.masterPassword;
+}
+
+async function revokeImpersonationGrant(
+  cookieStore: Awaited<ReturnType<typeof cookies>>,
+): Promise<void> {
+  const grant = openImpersonationGrant(cookieStore.get(IMPERSONATION_GRANT_COOKIE)?.value);
+  cookieStore.delete(IMPERSONATION_GRANT_COOKIE);
+  const config = readImpersonationConfig();
+  if (!grant || !config) return;
+  try {
+    await revokeImpersonationCredential({
+      serverUrl: grant.serverUrl,
+      mailbox: grant.mailbox,
+      masterUser: config.masterUser,
+      masterPassword: config.masterPassword,
+      id: grant.credentialId,
+    });
+  } catch (error) {
+    // The app password still expires on its own; sign-out must not fail.
+    logger.warn('Impersonation credential revocation failed', {
+      error: error instanceof Error ? error.message : 'Unknown error',
+    });
+  }
 }
 
 function getSlot(request: NextRequest): number {
@@ -36,6 +78,8 @@ export async function POST(request: NextRequest) {
   // so a cross-site top-level POST would otherwise reach this handler.
   const crossOrigin = rejectCrossOriginRequest(request);
   if (crossOrigin) return crossOrigin;
+  let upstreamUrl = '';
+  let upstreamTrusted = false;
   try {
     const oauthEnabled = configManager.get<boolean>('oauthEnabled', false);
     const oauthOnly = configManager.get<boolean>('oauthOnly', false);
@@ -43,8 +87,10 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Basic authentication is disabled' }, { status: 403 });
     }
 
-    const { serverUrl, username, password, slot: bodySlot } = await request.json();
-    if (!serverUrl || !username || !password) {
+    // A password signs in with Basic auth, an access token (token login) with
+    // Bearer: exactly one of them.
+    const { serverUrl, username, password, token: accessToken, slot: bodySlot } = await request.json();
+    if (!serverUrl || !username || typeof (password || accessToken) !== 'string' || !!password === !!accessToken) {
       return NextResponse.json({ error: 'Missing required fields' }, { status: 400 });
     }
 
@@ -63,8 +109,6 @@ export async function POST(request: NextRequest) {
     const serverList = parseJmapServers(configManager.get<unknown>('jmapServers', []));
     const trustedUrl = resolveTrustedJmapUrl(serverUrl, configuredServerUrl, serverList);
 
-    let upstreamUrl: string;
-    let upstreamTrusted: boolean;
     if (trustedUrl) {
       upstreamUrl = trustedUrl;
       upstreamTrusted = true;
@@ -80,7 +124,9 @@ export async function POST(request: NextRequest) {
 
     const slot = typeof bodySlot === 'number' && bodySlot >= 0 && bodySlot < MAX_ACCOUNT_SLOTS ? bodySlot : getSlot(request);
     const cookieName = sessionCookieName(slot);
-    const authHeader = `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`;
+    const authHeader = accessToken
+      ? `Bearer ${accessToken}`
+      : `Basic ${Buffer.from(`${username}:${password}`).toString('base64')}`;
     // Always verify the credential upstream (GHSA-wxcm-j4jc-9fxq). The cookies
     // written here are not only replayed as credentials (where a bogus
     // password would just 401 downstream): the encrypted auth context is also
@@ -88,24 +134,55 @@ export async function POST(request: NextRequest) {
     // server, such as settings sync. Skipping the check for admin-configured
     // servers let anyone mint a cookie for any username with a made-up
     // password. `trusted` only relaxes the public-address requirement.
-    const normalizedServerUrl = await verifyJmapIdentity(upstreamUrl, authHeader, username, {
-      trusted: upstreamTrusted,
-    });
-    const token = encryptSession(normalizedServerUrl, username, password);
+    // Wrong credentials tried from here count against this server's address
+    // upstream, so each client gets a failure budget (lib/auth/verify-budget.ts).
+    const clientIp = loginClientAddress(request);
+    const refund = reserveLoginAttempt(clientIp);
+    if (!refund) {
+      return NextResponse.json(
+        { error: 'too_many_attempts', hint: 'Too many failed sign-in attempts. Try again later.' },
+        { status: 429, headers: { 'Retry-After': String(LOGIN_BUDGET_RETRY_AFTER_SECONDS) } },
+      );
+    }
+    // The context cookie also records which account the credential belongs
+    // to: a Bearer login may claim a bare local part (`john`) that several
+    // accounts on a multi-domain server answer to, and per-user data such as
+    // synced settings must be keyed on the account, not on the claim.
+    let normalizedServerUrl: string;
+    let accountName: string;
+    try {
+      ({ serverUrl: normalizedServerUrl, accountName } = await resolveJmapIdentity(upstreamUrl, authHeader, username, {
+        trusted: upstreamTrusted,
+        clientIp,
+      }));
+    } catch (error) {
+      // Only a credential the server rejected spends the budget; an outage
+      // or a mismatched claim says nothing about the password.
+      if (!(error instanceof JmapAuthVerificationError && error.status === 401)) refund();
+      throw error;
+    }
+    refund();
+    const token = encryptSession(normalizedServerUrl, username, accessToken ? { token: accessToken } : password);
     const cookieStore = await cookies();
     cookieStore.set(cookieName, token, sessionCookieOptions());
     setStalwartAuthContextInStore(cookieStore, slot, {
       serverUrl: normalizedServerUrl,
       username,
       authHeader,
+      ...(accountName !== username ? { accountName } : {}),
     });
 
     void recordLogin(username, normalizedServerUrl);
 
-    return NextResponse.json({ ok: true });
+    const warning = insecureCookieHint(request);
+    if (warning) logger.warn(`session: ${warning}`);
+    return NextResponse.json(warning ? { ok: true, warning } : { ok: true });
   } catch (error) {
     if (error instanceof JmapAuthVerificationError) {
-      return NextResponse.json({ error: error.message }, { status: error.status });
+      return NextResponse.json(
+        verificationFailureBody('session', error, upstreamUrl, upstreamTrusted),
+        { status: error.status },
+      );
     }
 
     logger.error('Session store error', { error: error instanceof Error ? error.message : 'Unknown error' });
@@ -134,7 +211,7 @@ export async function GET(request: NextRequest) {
     setStalwartAuthContextInStore(cookieStore, slot, {
       serverUrl: credentials.serverUrl,
       username: credentials.username,
-      authHeader: `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString('base64')}`,
+      authHeader: sessionAuthHeader(credentials),
     });
 
     // Only return non-sensitive fields. Use PUT to retrieve full credentials.
@@ -150,7 +227,7 @@ export async function GET(request: NextRequest) {
 }
 
 /**
- * PUT - retrieve full credentials (including password) for session restoration.
+ * PUT - retrieve full credentials (password or access token) for session restoration.
  * Protected by multiple Sec-Fetch-* headers to ensure only same-origin
  * browser fetch() requests succeed. Non-browser clients cannot forge these.
  */
@@ -175,7 +252,7 @@ export async function PUT(request: NextRequest) {
     }
 
     const credentials = decryptSession(token);
-    if (!credentials) {
+    if (!credentials || holdsMasterPassword(credentials)) {
       cookieStore.delete(cookieName);
       clearStalwartAuthContextInStore(cookieStore, slot);
       return NextResponse.json({ error: 'Invalid session' }, { status: 401 });
@@ -184,7 +261,7 @@ export async function PUT(request: NextRequest) {
     setStalwartAuthContextInStore(cookieStore, slot, {
       serverUrl: credentials.serverUrl,
       username: credentials.username,
-      authHeader: `Basic ${Buffer.from(`${credentials.username}:${credentials.password}`).toString('base64')}`,
+      authHeader: sessionAuthHeader(credentials),
     });
 
     return NextResponse.json(credentials, {
@@ -204,6 +281,8 @@ export async function DELETE(request: NextRequest) {
   try {
     const cookieStore = await cookies();
     const all = request.nextUrl.searchParams.get('all') === 'true';
+    // Office editors opened from here stop working with the session.
+    await revokeWopiTokens(cookieStore, all ? 'all' : getSlot(request));
 
     if (all) {
       // Delete all session cookies across every slot.
@@ -211,10 +290,16 @@ export async function DELETE(request: NextRequest) {
         cookieStore.delete(sessionCookieName(i));
         clearStalwartAuthContextInStore(cookieStore, i);
       }
+      await revokeImpersonationGrant(cookieStore);
+      // A phone that already paired keeps its own sign-in; a QR still on
+      // screen stops working.
+      clearPairReauthInStore(cookieStore);
     } else {
       const slot = getSlot(request);
       cookieStore.delete(sessionCookieName(slot));
       clearStalwartAuthContextInStore(cookieStore, slot);
+      if (slot === 0) await revokeImpersonationGrant(cookieStore);
+      clearPairReauthInStore(cookieStore, slot);
     }
 
     return NextResponse.json({ ok: true });
