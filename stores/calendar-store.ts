@@ -990,11 +990,16 @@ export const useCalendarStore = create<CalendarStore>()(
         refetchVisibleRange = () => get().fetchEvents(client, start, end, { silent: true });
         const seq = ++rangeLoadSeq;
         set(options?.silent ? { error: null } : { isLoadingEvents: true, error: null });
+
+        const data = await calendarHooks.onBeforeFetchEvents.transform({ start: start, end: end });
+        start = data.start;
+        end = data.end;
+
         try {
-          const rawEvents = await client.queryAllCalendarEvents({
+          const rawEvents = await calendarHooks.onFetchingEvents.transform(await client.queryAllCalendarEvents({
             after: start,
             before: end,
-          });
+          }));
           if (seq !== rangeLoadSeq || currentStoreEpoch() !== epoch) return;
           // Filter out malformed events missing required 'start' field, or
           // whose start string fails to parse (would otherwise crash format()
@@ -1081,6 +1086,9 @@ export const useCalendarStore = create<CalendarStore>()(
       },
 
       fetchAllAccountsEvents: async (accounts, start, end, options) => {
+        const data = await calendarHooks.onBeforeFetchEvents.transform({ start: start, end: end });
+        start = data.start;
+        end = data.end;
         const epoch = currentStoreEpoch();
         refetchVisibleRange = () => get().fetchAllAccountsEvents(accounts, start, end, { silent: true });
         const seq = ++rangeLoadSeq;
@@ -1090,7 +1098,7 @@ export const useCalendarStore = create<CalendarStore>()(
           const results = await Promise.all(
             accounts.map(async ({ client, localAccountId }) => {
               try {
-                const raw = await client.queryAllCalendarEvents({ after: start, before: end });
+                const raw = await calendarHooks.onFetchingEvents.transform(await client.queryAllCalendarEvents({ after: start, before: end }));
                 const valid = raw.filter(e =>
                   typeof e.start === 'string' && e.start && !isNaN(parseISO(e.start).getTime())
                 );
@@ -1266,7 +1274,7 @@ export const useCalendarStore = create<CalendarStore>()(
           const inTwoSteps = !!storeEvent && (target.isOccurrence || !!target.isBrowserOccurrence)
             && reachesOnlyUnanswered(storeEvent, cleanUpdates, sendSchedulingMessages, options);
 
-          const {localUpdates, serverUpdates} = await calendarHooks.onUpdatingEvent.transform({localUpdates : cleanUpdates, serverUpdates: cleanUpdates})
+          const {localUpdates, serverUpdates} = await calendarHooks.onUpdatingEvent.transform({localUpdates : cleanUpdates, serverUpdates: cleanUpdates, eventId: id})
           
           if (target.isOccurrence && storeEvent) {
             if (stopsDefaultAlerts && storeEvent.baseEventId) {

@@ -544,6 +544,8 @@ export const calendarHooks = {
   onBeforeEventDelete: new HookBus(),
   onAfterEventDelete: new HookBus(),
   onCreatingEvent: new HookBus(),
+  onFetchingEvents: new HookBus(),
+  onBeforeFetchEvents: new HookBus(),
   onUpdatingEvent: new HookBus(),
   onBeforeEventRsvp: new HookBus(),
   onEventRsvp: new HookBus(),
