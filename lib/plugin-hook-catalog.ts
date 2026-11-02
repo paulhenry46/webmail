@@ -136,8 +136,14 @@ export const HOOK_CATALOG = {
   onCalendarEventFormSave: H('calendar', 'transform', 'calendar:write', 'CalendarEventFormSavePatch, CalendarEventFormView', 'while the event form is saved'),
   onCheckEventConflicts: H('calendar', 'transform', 'calendar:read', 'ConflictWarning[], { event }', 'while start or end change in the event form'),
   onBeforeEventCreate: H('calendar', 'intercept', 'calendar:write', 'CalendarEventView', 'before an event is created'),
+  // transform the event before it is sent to the server, and also transform the local event for the store.
+  onCreatingEvent: H('calendar', 'transform', 'calendar:write', 'CalendarEvent', 'when an event is created'),
   onAfterEventCreate: H('calendar', 'observer', 'calendar:read', 'CalendarEventView', 'after an event was created'),
   onBeforeEventUpdate: H('calendar', 'intercept', 'calendar:write', '{ eventId, patch }', 'before an event is changed'),
+  // transform the event before it is sent to the server, and also transform the local event for the store.
+  onUpdatingEvent: H('calendar', 'transform', 'calendar:write', 'Partial<CalendarEvent>', 'when an event is updated'),
+  onBeforeFetchEvents: H('calendar', 'transform', 'calendar:read', '{ start, end }', 'before events are fetched from the server; may change the range'),
+  onFetchingEvents: H('calendar', 'transform', 'calendar:read', 'CalendarEvent[], { start, end }', 'after events are fetched from the server; may add or remove events'),
   onAfterEventUpdate: H('calendar', 'observer', 'calendar:read', 'CalendarEventView', 'after an event was changed'),
   onBeforeEventDelete: H('calendar', 'intercept', 'calendar:write', '{ eventId, title }', 'before an event is deleted'),
   onAfterEventDelete: H('calendar', 'observer', 'calendar:read', '{ eventId, title }', 'after an event was deleted'),
